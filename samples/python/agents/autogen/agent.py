@@ -82,14 +82,11 @@ class Agent:
     async def process_event(self, event, session_id: str) -> Dict[str, Any]:
         try:
             if isinstance(event, BaseAgentEvent):
-                content, images = self.extract_message_content(event)
-                model_usage = event.model_dump().get("model_usage", None)
+                content = event.model_dump_json()
                 return {
                     "is_task_complete": False,
                     "require_user_input": False,
-                    "model_usage": model_usage,
                     "content": content,
-                    "images": images,
                 }
             elif isinstance(event, TaskResult):
                 async with self.session_lock:
@@ -115,29 +112,19 @@ class Agent:
                 images = []
                 if len(event.messages) > 0:
                     last_message = event.messages[-1]
-                    content_text, content_images = self.extract_message_content(
-                        last_message
-                    )
-                    content = content_text
-                    images = content_images
+                    content = last_message.model_dump_json()
 
                 return {
                     "is_task_complete": True,
                     "require_user_input": False,
-                    "model_usage": None,
                     "content": content,
-                    "images": images,
                 }
             elif isinstance(event, BaseChatMessage):
-                content, images = self.extract_message_content(event)
-                print(f"content: {content}", f"images: {images}")
-                model_usage = event.model_dump().get("model_usage", None)
+                content = event.model_dump_json()
                 return {
                     "is_task_complete": False,
                     "require_user_input": False,
-                    "model_usage": model_usage,
                     "content": content,
-                    "images": images,
                 }
         except Exception as e:
             logger.info(f"Error in process_event: {e}")
