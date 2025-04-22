@@ -48,8 +48,6 @@ class AgentTaskManager(InMemoryTaskManager):
                     {
                         "type": "text",
                         "text": item["content"],
-                        "images": item["images"],
-                        "model_usage": item.get("model_usage", None),
                     }
                 ]
                 end_stream = False
