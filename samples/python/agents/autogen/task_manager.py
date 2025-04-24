@@ -25,6 +25,7 @@ from typing import Union
 import asyncio
 import logging
 import traceback
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,11 @@ class AgentTaskManager(InMemoryTaskManager):
                 parts = [
                     {
                         "type": "text",
-                        "text": item["content"],
+                        "text": json.dumps({
+                            "content": item["content"],
+                            "images": item.get("images", []),
+                            "type": item.get("type", None),
+                        }),
                     }
                 ]
                 end_stream = False
