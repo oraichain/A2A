@@ -1,6 +1,6 @@
 from mem0 import Memory
 from qdrant_client import QdrantClient
-
+import os
 
 class MemoryManager:
     def __init__(self, name: str, in_mem_vector_store: bool = False):
@@ -15,19 +15,21 @@ class MemoryManager:
                     },
                 },
                 "llm": {
-                    "provider": "ollama",
+                    "provider": "openai",
                     "config": {
-                        "model": "qwen2.5-coder:32b",
+                        "model": "gpt-4o-mini",
                         "temperature": 0,
                         "max_tokens": 40000,
-                        "ollama_base_url": "https://ollama.orai.network",
+                        # "ollama_base_url": "https://litellm.distilled.ai/",
+                        "api_key": os.getenv("API_KEY"),
                     },
                 },
                 "embedder": {
-                    "provider": "ollama",
+                    "provider": "openai",
                     "config": {
-                        "model": "nomic-embed-text:latest",
-                        "ollama_base_url": "https://ollama.orai.network",
+                        "model": "text-embedding-3-small",
+                        # "ollama_base_url": "https://litellm.distilled.ai/",
+                        "api_key": os.getenv("API_KEY"),
                     },
                 },
             }

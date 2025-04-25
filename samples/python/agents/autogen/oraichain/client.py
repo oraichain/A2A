@@ -93,4 +93,11 @@ if __name__ == '__main__':
     sessionId = "743712a8805942dc991d3e060b8753c0"
     a2a_server_url = 'http://localhost:10002'
     agent = A2AAgent(a2a_server_url=a2a_server_url, session=sessionId, history=True)
-    asyncio.run(agent.step(['Whats the balance of orai179dea42h80arp69zd779zcav5jp0kv04zx4h09?']))
+    
+    PROMPT_TO_TEST = """
+Here will be your task, please do it from step by step, one task is done you will able to move to next task. DO NOT use liquidity heatmap tool, function for analyzing:
+
+Fetching every whales on some markets Find trading patterns and strategies identified based on latest whales activity, histocial trading pnl Risk assessment of all current positions Analyze market trend based on 30 days of tokens Define short-term trades as many as possible that can be executed with safety scoring and entries, stop loss, take profit, concise description, bias including short-term or long-term trades. The entries should be closest to latest price, stop loss and take profit should be realistic which is not too far from entry. Write report into a md file and remain the wallet address for checking instead of shorting it, and give me a time that i should generate this report again since the trades may change    
+    
+"""
+    asyncio.run(agent.step([PROMPT_TO_TEST]))

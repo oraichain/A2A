@@ -21,6 +21,8 @@ from autogen_core.models import RequestUsage
 from typing import AsyncIterable, Dict, Any, TypedDict, AsyncGenerator, Tuple, List
 from datetime import timezone
 from litellm import completion_cost
+from mcp.client.session import ClientSession
+from mcp.client.sse import sse_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ class Agent:
         timeout: int = 900,
         max_concurrent_tasks: int = 10,
         in_mem_vector_store: bool = False,
+        use_memory: bool = False,
     ):
         self.LABEL = label
         self.SYSTEM_INSTRUCTION = system_instruction
@@ -56,7 +59,14 @@ class Agent:
         self.session_timeout = timedelta(seconds=self.timeout)
         self.max_concurrent_tasks = max_concurrent_tasks
         self.semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
-        self.memory_manager = MemoryManager(label, in_mem_vector_store)
+        if use_memory:
+            self.memory_manager = MemoryManager(label, in_mem_vector_store)
+        else:
+            self.memory_manager = None
+        
+        self.sse_mcp_server_urls = []
+        self.mcp_server_params = []
+        self.sse_mcp_server_sessions = []
 
     async def initialize(self, mcp_server_params: list[McpServerParams] = []):
         api_key = os.getenv("API_KEY")
@@ -75,7 +85,69 @@ class Agent:
             self.tools.extend(server_tools)
         asyncio.create_task(self.cleanup_sessions())
         logger.info(f"{self.LABEL} initialized and cleanup_sessions task scheduled")
+    async def initialize_with_mcp_sse_urls(self, sse_mcp_server_urls: list[str]):
+        api_key = os.getenv("API_KEY")
+        model = os.getenv("LLM_MODEL")
+        if not api_key or not model:
+            raise ValueError("API_KEY or LLM_MODEL not set")
+        if re.match(r"^claude", model):
+            self.model_client = AnthropicChatCompletionClient(model=model, api_key=api_key)
+        else:
+            self.model_client = OpenAIChatCompletionClient(model=model, api_key=api_key)
+        # FIXME: This is a hack to get the model name. With autogen, there could be multiple models in the config.
+        self.model_name = model
+        self.tools = []
         
+        # Close any existing SSE sessions before creating new ones
+        await self.close_sse_sessions()
+        
+        self.sse_mcp_server_urls = sse_mcp_server_urls
+        self.sse_mcp_server_sessions = []
+        self.mcp_server_params = []
+        
+        for url in sse_mcp_server_urls:
+            try:
+                streams = await sse_client(url)
+                session = ClientSession(streams[0], streams[1])
+                await session.initialize()
+                self.sse_mcp_server_sessions.append(session)
+                self.mcp_server_params.append(McpServerParams(url=url))
+                
+                # Get tools from this server and add to our tools list
+                server_tools = await mcp_server_tools(McpServerParams(url=url))
+                self.tools.extend(server_tools)
+                logger.info(f"Connected to MCP server at {url}")
+            except Exception as e:
+                logger.error(f"Error connecting to MCP server at {url}: {e}")
+        
+        asyncio.create_task(self.cleanup_sessions())
+        logger.info(f"{self.LABEL} initialized and cleanup_sessions task scheduled")
+        
+    async def shutdown(self):
+        """Shutdown the agent and cleanup resources."""
+        logger.info(f"Shutting down {self.LABEL} agent")
+        
+        # Close all sessions
+        async with self.session_lock:
+            for sid, data in list(self.sessions.items()):
+                try:
+                    await data["generator"].aclose()
+                    logger.info(f"Closed session {sid}")
+                except Exception as e:
+                    logger.error(f"Error closing session {sid}: {e}")
+                    
+        # Close SSE sessions
+        await self.close_sse_sessions()
+        
+        # Clean up any other resources
+        if self.memory_manager:
+            # Free memory if needed
+            logger.info("Cleaning up memory manager")
+            for sid in list(self.session_token_metrics.keys()):
+                self.memory_manager.delete_session(sid)
+                
+        logger.info(f"{self.LABEL} agent shutdown complete")
+
     def accumulate_token_metrics(self, session_id: str, model_usage: RequestUsage):
         self.session_token_metrics[session_id]["prompt_tokens"] += model_usage.prompt_tokens
         self.session_token_metrics[session_id]["completion_tokens"] += model_usage.completion_tokens
@@ -124,20 +196,21 @@ class Agent:
                         f"Estimated Cost=${self.session_token_metrics[session_id]['accumulated_cost']:.6f}"
                     )
                     del self.session_token_metrics[session_id]
-                    logger.info(
-                        f"Adding memory {event.messages} for session {session_id}"
-                    )
-                    for message in event.messages:
-                        if "content" in message.to_text():
-                            self.memory_manager.add_memory(
-                                session_id,
-                            [
-                                {
-                                    "role": "assistant",
-                                    "content": message.to_text(),
-                                },
-                            ],
+                    if self.memory_manager:
+                        logger.info(
+                            f"Adding memory {event.messages} for session {session_id}"
                         )
+                        for message in event.messages:
+                            if "content" in message.to_text():
+                                self.memory_manager.add_memory(
+                                    session_id,
+                                    [
+                                        {
+                                            "role": "assistant",
+                                            "content": message.to_text(),
+                                        },
+                                ],
+                            )
 
                 content = self.extract_task_result_content(event)
                 images = []
@@ -202,8 +275,19 @@ class Agent:
                     )
                     del self.sessions[sid]
                     del self.session_token_metrics[sid]
-                    self.memory_manager.delete_session(sid)
+                    if self.memory_manager:
+                        self.memory_manager.delete_session(sid)
             await asyncio.sleep(60)
+            
+    async def close_sse_sessions(self):
+        """Close all SSE sessions."""
+        for session in self.sse_mcp_server_sessions:
+            if session:
+                try:
+                    await session.close()
+                except Exception as e:
+                    logger.error(f"Error closing SSE session: {e}")
+        self.sse_mcp_server_sessions = []
 
     @staticmethod
     def extract_message_content(
@@ -247,14 +331,15 @@ class Agent:
                     orchestrator_agent = MagenticOneGroupChat(
                         participants=[mcp_agent], model_client=self.model_client
                     )
-                    relevant_memories = self.memory_manager.relevant_memories(
-                        session_id=session_id, query=query
-                    )
-                    logger.info(
-                        f"Relevant memories: {relevant_memories} for session {session_id} at query {query}"
-                    )
+                    if self.memory_manager:
+                        relevant_memories = self.memory_manager.relevant_memories(
+                            session_id=session_id, query=query
+                        )
+                        logger.info(
+                            f"Relevant memories: {relevant_memories} for session {session_id} at query {query}"
+                        )
                     task = query
-                    if len(relevant_memories) > 0:
+                    if self.memory_manager and len(relevant_memories) > 0:
                         flatten_relevant_memories = "\n".join(
                             [m["memory"] for m in relevant_memories]
                         )
@@ -263,12 +348,13 @@ class Agent:
                         "generator": orchestrator_agent.run_stream(task=task),
                         "last_accessed": datetime.now(timezone.utc),
                     }
-                    self.memory_manager.add_memory(
-                        session_id,
-                        [
-                            {"role": "user", "content": query},
-                        ],
-                    )
+                    if self.memory_manager:
+                        self.memory_manager.add_memory(
+                            session_id,
+                            [
+                                {"role": "user", "content": query},
+                            ],
+                        )
                 async with asyncio.timeout(self.timeout):
                     async for event in self.sessions[session_id]["generator"]:
                         async with self.session_lock:
