@@ -114,7 +114,7 @@ class Agent:
                 self.mcp_server_params.append(McpServerParams(url=url))
                 
                 # Get tools from this server and add to our tools list
-                server_tools = await mcp_server_tools(McpServerParams(url=url))
+                server_tools = await mcp_server_tools(McpServerParams(url=url), session=session)
                 self.tools.extend(server_tools)
                 logger.info(f"Connected to MCP server at {url}")
             except Exception as e:
