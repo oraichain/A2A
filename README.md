@@ -1,4 +1,5 @@
 ![image info](images/A2A_banner.png)
+[![Apache License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 **_An open protocol enabling communication and interoperability between opaque agentic applications._**
 
@@ -72,6 +73,7 @@ We highly value community contributions and appreciate your interest in A2A Prot
 * Have questions? Join our community in [GitHub discussions](https://github.com/google/A2A/discussions).
 * Want to help with protocol improvement feedback?  Dive into [GitHub issues](https://github.com/google/A2A/issues).
 * Private Feedback? Please use this [Google form](https://docs.google.com/forms/d/e/1FAIpQLScS23OMSKnVFmYeqS2dP7dxY3eTyT7lmtGLUa8OJZfP4RTijQ/viewform)
+* Existing Google cloud platform customer and want to join our partner program to contribute to A2A ecosystem? Please fill this [form](https://docs.google.com/forms/d/1VXYY1qBhUbRfY15Z5G_KPYoPC9d1LCrwde5ehjYKCZ8/preview)
 
 ### **What's next**
 
@@ -98,4 +100,4 @@ Future plans include improvements to the protocol itself and enhancements to the
 
 ### **About**
 
-A2A Protocol is an open source project run by Google LLC, under [License](LICENSE) and open to contributions from the entire community.
+A2A Protocol is an open source project run by Google LLC, under [Apache License](LICENSE) and open to contributions from the entire community.
