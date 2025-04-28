@@ -246,6 +246,7 @@ class AgentTaskManager(InMemoryTaskManager):
         return part.text
 
     async def send_task_notification(self, task: Task):
+        return
         logger.debug(f"Checking push notification for task {task.id}")
         if not await self.has_push_notification_info(task.id):
             logger.info(f"No push notification info found for task {task.id}")
@@ -261,25 +262,25 @@ class AgentTaskManager(InMemoryTaskManager):
         )
         logger.debug(f"Push notification sent for task {task.id}")
 
-    async def on_resubscribe_to_task(
-        self, request
-    ) -> AsyncIterable[SendTaskStreamingResponse] | JSONRPCResponse:
-        logger.debug(f"on_resubscribe_to_task called with request {request.id}")
-        task_id_params: TaskIdParams = request.params
-        try:
-            logger.debug(f"Setting up SSE consumer for task {task_id_params.id} with resubscribe=True")
-            sse_event_queue = await self.setup_sse_consumer(task_id_params.id, True)
+    # async def on_resubscribe_to_task(
+    #     self, request
+    # ) -> AsyncIterable[SendTaskStreamingResponse] | JSONRPCResponse:
+    #     logger.debug(f"on_resubscribe_to_task called with request {request.id}")
+    #     task_id_params: TaskIdParams = request.params
+    #     try:
+    #         logger.debug(f"Setting up SSE consumer for task {task_id_params.id} with resubscribe=True")
+    #         sse_event_queue = await self.setup_sse_consumer(task_id_params.id, True)
             
-            logger.debug(f"Returning SSE event queue for task {task_id_params.id}")
-            return self.dequeue_events_for_sse(
-                request.id, task_id_params.id, sse_event_queue
-            )
-        except Exception as e:
-            logger.error(f"Error while reconnecting to SSE stream: {e}")
-            logger.debug(f"Exception details for task resubscription {task_id_params.id}: {traceback.format_exc()}")
-            return JSONRPCResponse(
-                id=request.id,
-                error=InternalError(
-                    message=f"An error occurred while reconnecting to stream: {e}"
-                ),
-            )
+    #         logger.debug(f"Returning SSE event queue for task {task_id_params.id}")
+    #         return self.dequeue_events_for_sse(
+    #             request.id, task_id_params.id, sse_event_queue
+    #         )
+    #     except Exception as e:
+    #         logger.error(f"Error while reconnecting to SSE stream: {e}")
+    #         logger.debug(f"Exception details for task resubscription {task_id_params.id}: {traceback.format_exc()}")
+    #         return JSONRPCResponse(
+    #             id=request.id,
+    #             error=InternalError(
+    #                 message=f"An error occurred while reconnecting to stream: {e}"
+    #             ),
+    #         )
