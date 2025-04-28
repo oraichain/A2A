@@ -1,0 +1,100 @@
+import pymongo
+from pymongo import MongoClient
+import pandas as pd
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+
+# Connect to MongoDB
+client = MongoClient("mongodb+srv://minhdang:minhdang@cluster1.ylsst8b.mongodb.net/hyperwhales")
+db = client.hyperwhales
+
+# Query the positions collection for ETH positions
+pipeline = [
+    {"$match": {"token": "ETH"}},
+    {"$sort": {"snapshotTime": -1}},
+    {"$group": {
+        "_id": "$address",
+        "latestPosition": {"$first": "$$ROOT"},
+        "latestSnapshotTime": {"$first": "$snapshotTime"}
+    }},
+    {"$sort": {"latestPosition.usdSize": -1}},
+    {"$limit": 10}
+]
+
+top_eth_whales = list(db.positions.aggregate(pipeline))
+
+# Create a DataFrame for easier analysis
+whale_df = pd.DataFrame([
+    {
+        "address": whale["_id"],
+        "usdSize": whale["latestPosition"]["usdSize"],
+        "side": whale["latestPosition"]["side"],
+        "entryPrice": whale["latestPosition"]["entryPrice"],
+        "leverage": whale["latestPosition"]["leverage"],
+        "pnl": whale["latestPosition"]["pnl"],
+        "snapshotTime": whale["latestSnapshotTime"]
+    } for whale in top_eth_whales
+])
+
+print(whale_df)
+
+# Analyze position changes over the last 7 days
+seven_days_ago = datetime.utcnow() - timedelta(days=7)
+
+position_changes = []
+for address in whale_df["address"]:
+    positions = list(db.positions.find(
+        {"address": address, "token": "ETH", "snapshotTime": {"$gte": seven_days_ago}}
+    ).sort("snapshotTime", 1))
+    
+    if len(positions) > 1:
+        initial_position = positions[0]["usdSize"]
+        final_position = positions[-1]["usdSize"]
+        change = final_position - initial_position
+        percent_change = (change / initial_position) * 100 if initial_position != 0 else 0
+        position_changes.append({
+            "address": address,
+            "initial_position": initial_position,
+            "final_position": final_position,
+            "change": change,
+            "percent_change": percent_change
+        })
+
+position_changes_df = pd.DataFrame(position_changes)
+print("\nPosition changes over the last 7 days:")
+print(position_changes_df)
+
+# Visualize position changes
+plt.figure(figsize=(12, 6))
+plt.bar(position_changes_df["address"], position_changes_df["percent_change"])
+plt.title("ETH Whale Position Changes (Last 7 Days)")
+plt.xlabel("Whale Address")
+plt.ylabel("Percent Change")
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.savefig("eth_whale_position_changes.png")
+plt.close()
+
+# Analyze trading patterns
+trade_counts = db.positions.aggregate([
+    {"$match": {"address": {"$in": whale_df["address"].tolist()}, "token": "ETH", "snapshotTime": {"$gte": seven_days_ago}}},
+    {"$group": {"_id": "$address", "trade_count": {"$sum": 1}}}
+])
+
+trade_counts_df = pd.DataFrame(list(trade_counts))
+print("\nTrading activity in the last 7 days:")
+print(trade_counts_df)
+
+# Generate summary
+print("\nSummary of Ethereum Whale Trading Patterns:")
+print(f"1. We identified the top {len(whale_df)} Ethereum whales based on their current position sizes.")
+print(f"2. The largest whale position is worth ${whale_df['usdSize'].max():,.2f}, while the smallest of the top 10 is ${whale_df['usdSize'].min():,.2f}.")
+print(f"3. Over the last 7 days, {len(position_changes_df[position_changes_df['change'] > 0])} whales increased their positions, while {len(position_changes_df[position_changes_df['change'] < 0])} decreased them.")
+print(f"4. The most significant position change was a {position_changes_df['percent_change'].abs().max():.2f}% {'increase' if position_changes_df.loc[position_changes_df['percent_change'].abs().idxmax(), 'percent_change'] > 0 else 'decrease'}.")
+print("5. Trading activity varies among whales, with some being more active than others.")
+print("\nNotable observations:")
+for _, whale in position_changes_df.iterrows():
+    if abs(whale['percent_change']) > 10:
+        print(f"- Whale {whale['address']} {'increased' if whale['percent_change'] > 0 else 'decreased'} their position by {abs(whale['percent_change']):.2f}%")
+
+print("\nPlease refer to the 'eth_whale_position_changes.png' chart for a visual representation of position changes.")

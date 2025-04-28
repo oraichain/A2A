@@ -1,0 +1,33 @@
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+import pandas as pd
+
+# Connect to the database
+client = MongoClient('mongodb+srv://minhdang:minhdang@cluster1.ylsst8b.mongodb.net/hyperwhales')
+db = client.hyperwhales
+
+# Query for large ETH positions in the last 30 days
+thirty_days_ago = datetime.now() - timedelta(days=30)
+pipeline = [
+    {"$match": {
+        "token": "ETH",
+        "snapshotTime": {"$gte": thirty_days_ago},
+        "usdSize": {"$gte": 20000000}  # Approximately 10,000 ETH at current prices
+    }},
+    {"$group": {
+        "_id": "$address",
+        "avgPosition": {"$avg": "$usdSize"},
+        "lastPosition": {"$last": "$usdSize"},
+        "lastSnapshot": {"$max": "$snapshotTime"}
+    }},
+    {"$sort": {"avgPosition": -1}},
+    {"$limit": 100}
+]
+
+whales = list(db.positions.aggregate(pipeline))
+
+# Convert to DataFrame for easier analysis
+df_whales = pd.DataFrame(whales)
+
+print(f"Number of whale addresses identified: {len(df_whales)}")
+print(df_whales.head())

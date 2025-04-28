@@ -1,0 +1,82 @@
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+import pandas as pd
+
+# Connect to the MongoDB database
+client = MongoClient("mongodb+srv://minhdang:minhdang@cluster1.ylsst8b.mongodb.net/hyperwhales")
+db = client.hyperwhales
+
+# Get the current date and the date 30 days ago
+end_date = datetime.now()
+start_date = end_date - timedelta(days=30)
+
+# Query the positions collection for ETH positions
+pipeline = [
+    {"$match": {
+        "token": "ETH",
+        "snapshotTime": {"$gte": start_date, "$lte": end_date}
+    }},
+    {"$group": {
+        "_id": "$address",
+        "total_usd_size": {"$sum": "$usdSize"},
+        "latest_snapshot": {"$max": "$snapshotTime"}
+    }},
+    {"$sort": {"total_usd_size": -1}},
+    {"$limit": 100}
+]
+
+top_whales = list(db.positions.aggregate(pipeline))
+
+# Convert to DataFrame for easier analysis
+df_whales = pd.DataFrame(top_whales)
+df_whales.columns = ['address', 'total_usd_size', 'latest_snapshot']
+
+print(f"Top 10 Ethereum whale addresses by position size:")
+print(df_whales.head(10))
+
+# Analyze position changes over time
+position_changes = []
+
+for whale in top_whales:
+    address = whale['_id']
+    positions = list(db.positions.find({
+        "address": address,
+        "token": "ETH",
+        "snapshotTime": {"$gte": start_date, "$lte": end_date}
+    }).sort("snapshotTime", 1))
+    
+    if len(positions) > 1:
+        initial_position = positions[0]['usdSize']
+        final_position = positions[-1]['usdSize']
+        position_change = final_position - initial_position
+        position_changes.append({
+            "address": address,
+            "initial_position": initial_position,
+            "final_position": final_position,
+            "position_change": position_change,
+            "change_percentage": (position_change / initial_position) * 100 if initial_position != 0 else float('inf')
+        })
+
+df_changes = pd.DataFrame(position_changes)
+df_changes = df_changes.sort_values("change_percentage", ascending=False)
+
+print("\nTop 10 whales by position change percentage:")
+print(df_changes.head(10))
+
+print("\nBottom 10 whales by position change percentage:")
+print(df_changes.tail(10))
+
+# Calculate overall trend
+accumulating = df_changes[df_changes['position_change'] > 0].shape[0]
+distributing = df_changes[df_changes['position_change'] < 0].shape[0]
+neutral = df_changes[df_changes['position_change'] == 0].shape[0]
+
+print(f"\nOverall trend in whale behavior:")
+print(f"Accumulating: {accumulating}")
+print(f"Distributing: {distributing}")
+print(f"Neutral: {neutral}")
+
+# Identify any unusual or noteworthy transactions
+large_changes = df_changes[abs(df_changes['change_percentage']) > 50]
+print("\nNotable position changes (>50% change):")
+print(large_changes)

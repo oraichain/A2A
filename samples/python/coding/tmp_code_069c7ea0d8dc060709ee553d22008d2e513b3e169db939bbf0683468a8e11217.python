@@ -1,0 +1,95 @@
+import urllib.request
+import json
+from datetime import datetime, timedelta
+
+def make_request(url, data):
+    req = urllib.request.Request(url)
+    req.add_header('Content-Type', 'application/json')
+    req.add_header('Access-Control-Request-Headers', '*')
+    req.add_header('api-key', 'LtxF7j8gxjirByzTDBp9fRHSAaIuijLrNyG05XCxNKUgqbUqSrxdY2SnSNhZTxEg')
+    data = json.dumps(data).encode('utf-8')
+    response = urllib.request.urlopen(req, data)
+    return json.loads(response.read().decode('utf-8'))
+
+# MongoDB Data API endpoint
+url = "https://data.mongodb-api.com/app/data-bnzkp/endpoint/data/v1/action/aggregate"
+
+# Query the positions collection for ETH positions
+payload = {
+    "collection": "positions",
+    "database": "hyperwhales",
+    "dataSource": "Cluster1",
+    "pipeline": [
+        {"$match": {"token": "ETH"}},
+        {"$sort": {"snapshotTime": -1}},
+        {"$group": {
+            "_id": "$address",
+            "latestPosition": {"$first": "$$ROOT"},
+            "latestSnapshotTime": {"$first": "$snapshotTime"}
+        }},
+        {"$sort": {"latestPosition.usdSize": -1}},
+        {"$limit": 10}
+    ]
+}
+
+top_eth_whales = make_request(url, payload)["documents"]
+
+print("Top 10 ETH Whale Positions:")
+for whale in top_eth_whales:
+    print(f"Address: {whale['_id']}")
+    print(f"USD Size: ${whale['latestPosition']['usdSize']:,.2f}")
+    print(f"Side: {whale['latestPosition']['side']}")
+    print(f"Entry Price: ${whale['latestPosition']['entryPrice']:,.2f}")
+    print(f"Leverage: {whale['latestPosition']['leverage']}x")
+    print(f"PNL: ${whale['latestPosition']['pnl']:,.2f}")
+    print(f"Snapshot Time: {whale['latestSnapshotTime']}")
+    print("---")
+
+# Analyze position changes over the last 7 days
+seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+
+position_changes = []
+for whale in top_eth_whales:
+    address = whale['_id']
+    payload = {
+        "collection": "positions",
+        "database": "hyperwhales",
+        "dataSource": "Cluster1",
+        "filter": {"address": address, "token": "ETH", "snapshotTime": {"$gte": seven_days_ago}},
+        "sort": {"snapshotTime": 1}
+    }
+    positions = make_request("https://data.mongodb-api.com/app/data-bnzkp/endpoint/data/v1/action/find", payload)["documents"]
+    
+    if len(positions) > 1:
+        initial_position = positions[0]["usdSize"]
+        final_position = positions[-1]["usdSize"]
+        change = final_position - initial_position
+        percent_change = (change / initial_position) * 100 if initial_position != 0 else 0
+        position_changes.append({
+            "address": address,
+            "initial_position": initial_position,
+            "final_position": final_position,
+            "change": change,
+            "percent_change": percent_change
+        })
+
+print("\nPosition changes over the last 7 days:")
+for change in position_changes:
+    print(f"Address: {change['address']}")
+    print(f"Initial Position: ${change['initial_position']:,.2f}")
+    print(f"Final Position: ${change['final_position']:,.2f}")
+    print(f"Change: ${change['change']:,.2f}")
+    print(f"Percent Change: {change['percent_change']:.2f}%")
+    print("---")
+
+# Generate summary
+print("\nSummary of Ethereum Whale Trading Patterns:")
+print(f"1. We identified the top {len(top_eth_whales)} Ethereum whales based on their current position sizes.")
+print(f"2. The largest whale position is worth ${max(whale['latestPosition']['usdSize'] for whale in top_eth_whales):,.2f}, while the smallest of the top 10 is ${min(whale['latestPosition']['usdSize'] for whale in top_eth_whales):,.2f}.")
+print(f"3. Over the last 7 days, {len([c for c in position_changes if c['change'] > 0])} whales increased their positions, while {len([c for c in position_changes if c['change'] < 0])} decreased them.")
+print(f"4. The most significant position change was a {max(abs(c['percent_change']) for c in position_changes):.2f}% {'increase' if max(c['percent_change'] for c in position_changes) > 0 else 'decrease'}.")
+
+print("\nNotable observations:")
+for change in position_changes:
+    if abs(change['percent_change']) > 10:
+        print(f"- Whale {change['address']} {'increased' if change['percent_change'] > 0 else 'decreased'} their position by {abs(change['percent_change']):.2f}%")

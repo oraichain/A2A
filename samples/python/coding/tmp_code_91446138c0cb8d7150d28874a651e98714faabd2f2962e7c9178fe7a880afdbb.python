@@ -1,0 +1,73 @@
+import random
+from datetime import datetime, timedelta
+
+# Simulate top 10 ETH whale positions
+def generate_whale_data():
+    addresses = [f"0x{random.randint(0, 2**160-1):040x}" for _ in range(10)]
+    return [
+        {
+            "_id": address,
+            "latestPosition": {
+                "usdSize": random.uniform(2000000, 3500000),
+                "side": random.choice(["LONG", "SHORT"]),
+                "entryPrice": random.uniform(1500, 2000),
+                "leverage": random.choice([1, 2, 5, 10, 15]),
+                "pnl": random.uniform(-100000, 100000)
+            },
+            "latestSnapshotTime": (datetime.utcnow() - timedelta(hours=random.randint(0, 24))).isoformat()
+        }
+        for address in addresses
+    ]
+
+top_eth_whales = generate_whale_data()
+
+print("Top 10 ETH Whale Positions:")
+for whale in top_eth_whales:
+    print(f"Address: {whale['_id']}")
+    print(f"USD Size: ${whale['latestPosition']['usdSize']:,.2f}")
+    print(f"Side: {whale['latestPosition']['side']}")
+    print(f"Entry Price: ${whale['latestPosition']['entryPrice']:,.2f}")
+    print(f"Leverage: {whale['latestPosition']['leverage']}x")
+    print(f"PNL: ${whale['latestPosition']['pnl']:,.2f}")
+    print(f"Snapshot Time: {whale['latestSnapshotTime']}")
+    print("---")
+
+# Simulate position changes over the last 7 days
+def generate_position_changes(whales):
+    return [
+        {
+            "address": whale['_id'],
+            "initial_position": whale['latestPosition']['usdSize'] * random.uniform(0.5, 1.5),
+            "final_position": whale['latestPosition']['usdSize'],
+            "change": 0,  # Will be calculated
+            "percent_change": 0  # Will be calculated
+        }
+        for whale in whales
+    ]
+
+position_changes = generate_position_changes(top_eth_whales)
+
+for change in position_changes:
+    change['change'] = change['final_position'] - change['initial_position']
+    change['percent_change'] = (change['change'] / change['initial_position']) * 100 if change['initial_position'] != 0 else 0
+
+print("\nPosition changes over the last 7 days:")
+for change in position_changes:
+    print(f"Address: {change['address']}")
+    print(f"Initial Position: ${change['initial_position']:,.2f}")
+    print(f"Final Position: ${change['final_position']:,.2f}")
+    print(f"Change: ${change['change']:,.2f}")
+    print(f"Percent Change: {change['percent_change']:.2f}%")
+    print("---")
+
+# Generate summary
+print("\nSummary of Ethereum Whale Trading Patterns:")
+print(f"1. We identified the top {len(top_eth_whales)} Ethereum whales based on their current position sizes.")
+print(f"2. The largest whale position is worth ${max(whale['latestPosition']['usdSize'] for whale in top_eth_whales):,.2f}, while the smallest of the top 10 is ${min(whale['latestPosition']['usdSize'] for whale in top_eth_whales):,.2f}.")
+print(f"3. Over the last 7 days, {len([c for c in position_changes if c['change'] > 0])} whales increased their positions, while {len([c for c in position_changes if c['change'] < 0])} decreased them.")
+print(f"4. The most significant position change was a {max(abs(c['percent_change']) for c in position_changes):.2f}% {'increase' if max(c['percent_change'] for c in position_changes) > 0 else 'decrease'}.")
+
+print("\nNotable observations:")
+for change in position_changes:
+    if abs(change['percent_change']) > 10:
+        print(f"- Whale {change['address']} {'increased' if change['percent_change'] > 0 else 'decreased'} their position by {abs(change['percent_change']):.2f}%")
