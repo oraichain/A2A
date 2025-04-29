@@ -261,7 +261,8 @@ class InMemoryTaskManager(TaskManager):
         self, request_id, task_id, sse_event_queue: asyncio.Queue
     ) -> AsyncIterable[SendTaskStreamingResponse] | JSONRPCResponse:
         try:
-            while True:                
+            while True:   
+                # TODO: We need a mechanism to store TaskStatusUpdateEvent, in case there's something wrong -> return everything so far / summarize the task so far.          
                 event = await sse_event_queue.get()
                 if isinstance(event, JSONRPCError):
                     yield SendTaskStreamingResponse(id=request_id, error=event)

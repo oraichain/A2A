@@ -5,7 +5,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import re
 from agents.autogen.memory_manager import MemoryManager
-from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.agents import AssistantAgent, CodeExecutorAgent
+from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.anthropic import AnthropicChatCompletionClient
@@ -49,6 +50,7 @@ class Agent:
         self.SUPPORTED_CONTENT_TYPES = supported_content_types
         self.model_client = None
         self.mcp_agent = None
+        self.code_executor_agent = None
         self.sessions: Dict[str, SessionData] = defaultdict(dict)
         # Track cumulative token metrics per session
         self.session_token_metrics: Dict[str, Dict[str, int]] = defaultdict(
@@ -67,6 +69,7 @@ class Agent:
         self.sse_mcp_server_urls = []
         self.mcp_server_params = []
         self.sse_mcp_server_sessions = []
+        self.code_executor = DockerCommandLineCodeExecutor(work_dir="coding", container_name="code-executor")
 
     async def initialize(self, mcp_server_params: list[McpServerParams] = []):
         api_key = os.getenv("API_KEY")
@@ -171,7 +174,13 @@ class Agent:
     async def process_event(self, event, session_id: str) -> Dict[str, Any]:
         try:
             if isinstance(event, BaseAgentEvent):
-                content, images = self.extract_message_content(event)
+                try:
+                    content, images = self.extract_message_content(event)
+                except Exception as e:
+                    logger.error(f"Error extracting message content: {e}")
+                    content = str(event)
+                    images = []
+                    
                 model_usage = event.models_usage
                 if model_usage:
                     self.accumulate_token_metrics(session_id, model_usage)
@@ -215,12 +224,15 @@ class Agent:
                 content = self.extract_task_result_content(event)
                 images = []
                 if len(event.messages) > 0:
-                    last_message = event.messages[-1]
-                    content_text, content_images = self.extract_message_content(
-                        last_message
-                    )
-                    content = content_text
-                    images = content_images
+                    try:
+                        last_message = event.messages[-1]
+                        content_text, content_images = self.extract_message_content(
+                            last_message
+                        )
+                        content = content_text
+                        images = content_images
+                    except Exception as e:
+                        logger.error(f"Error extracting message content from task result: {e}")
 
                 return {
                     "is_task_complete": True,
@@ -230,12 +242,17 @@ class Agent:
                     "images": images,
                 }
             elif isinstance(event, BaseChatMessage):
-                content, images = self.extract_message_content(event)
+                try:
+                    content, images = self.extract_message_content(event)
+                except Exception as e:
+                    logger.error(f"Error extracting message content: {e}")
+                    content = event.to_text() if hasattr(event, 'to_text') else str(event)
+                    images = []
+                    
                 model_usage = event.models_usage
                 if model_usage:
                     self.accumulate_token_metrics(session_id, model_usage)
-                    
-                print(f"content: {content}", f"images: {images}")
+                
                 return {
                     "is_task_complete": False,
                     "require_user_input": False,
@@ -328,8 +345,17 @@ class Agent:
                         tools=self.tools,
                         system_message=self.SYSTEM_INSTRUCTION,
                     )
+                    await self.code_executor.start()
+                    code_executor_agent = CodeExecutorAgent(
+                        name="HyperwhalesAnalyst",
+                        model_client=self.model_client,
+                        code_executor=self.code_executor,
+                        system_message=self.SYSTEM_INSTRUCTION,
+                        description="Expert analyst who can execute code to navigate database, analyze data and provide insights",
+                        
+                    )
                     orchestrator_agent = MagenticOneGroupChat(
-                        participants=[mcp_agent], model_client=self.model_client
+                        participants=[ code_executor_agent], model_client=self.model_client
                     )
                     if self.memory_manager:
                         relevant_memories = self.memory_manager.relevant_memories(
@@ -372,6 +398,7 @@ class Agent:
                     "is_task_complete": True,
                     "require_user_input": False,
                     "content": "Task timed out",
+                    "images": [],
                 }
             except Exception as e:
                 logger.error(f"Error in stream for session {session_id}: {e}")
@@ -383,6 +410,7 @@ class Agent:
                     "is_task_complete": True,
                     "require_user_input": False,
                     "content": f"Error: {str(e)}",
+                    "images": [],
                 }
             finally:
                 logger.info(f"Stream for session {session_id} completed")
