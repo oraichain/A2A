@@ -1,6 +1,10 @@
-from typing import AsyncIterable
+from typing import AsyncIterable, override
 from common.types import (
+    GetTaskRequest,
+    GetTaskResponse,
     SendTaskRequest,
+    TaskNotFoundError,
+    TaskQueryParams,
     TaskSendParams,
     Message,
     TaskStatus,
@@ -35,6 +39,17 @@ class AgentTaskManager(InMemoryTaskManager):
         super().__init__()
         self.agent = agent
         logger.debug(f"AgentTaskManager initialized with agent: {agent}")
+        
+    @override
+    async def on_get_task(self, request: GetTaskRequest) -> GetTaskResponse:
+        logger.debug(f"on_get_task called with request {request.id}")
+        task_query_params: TaskQueryParams = request.params
+
+        async with self.lock:
+            task = self.tasks.get(task_query_params.id)
+            if task is None:
+                return GetTaskResponse(id=request.id, error=TaskNotFoundError())
+        return GetTaskResponse(id=request.id, result=task)
 
     async def _run_streaming_agent(self, request: SendTaskStreamingRequest):
         logger.debug(f"Starting _run_streaming_agent with request: {request.id}")
@@ -262,25 +277,25 @@ class AgentTaskManager(InMemoryTaskManager):
         )
         logger.debug(f"Push notification sent for task {task.id}")
 
-    # async def on_resubscribe_to_task(
-    #     self, request
-    # ) -> AsyncIterable[SendTaskStreamingResponse] | JSONRPCResponse:
-    #     logger.debug(f"on_resubscribe_to_task called with request {request.id}")
-    #     task_id_params: TaskIdParams = request.params
-    #     try:
-    #         logger.debug(f"Setting up SSE consumer for task {task_id_params.id} with resubscribe=True")
-    #         sse_event_queue = await self.setup_sse_consumer(task_id_params.id, True)
+    async def on_resubscribe_to_task(
+        self, request
+    ) -> AsyncIterable[SendTaskStreamingResponse] | JSONRPCResponse:
+        logger.debug(f"on_resubscribe_to_task called with request {request.id}")
+        task_id_params: TaskIdParams = request.params
+        try:
+            logger.debug(f"Setting up SSE consumer for task {task_id_params.id} with resubscribe=True")
+            sse_event_queue = await self.setup_sse_consumer(task_id_params.id, True)
             
-    #         logger.debug(f"Returning SSE event queue for task {task_id_params.id}")
-    #         return self.dequeue_events_for_sse(
-    #             request.id, task_id_params.id, sse_event_queue
-    #         )
-    #     except Exception as e:
-    #         logger.error(f"Error while reconnecting to SSE stream: {e}")
-    #         logger.debug(f"Exception details for task resubscription {task_id_params.id}: {traceback.format_exc()}")
-    #         return JSONRPCResponse(
-    #             id=request.id,
-    #             error=InternalError(
-    #                 message=f"An error occurred while reconnecting to stream: {e}"
-    #             ),
-    #         )
+            logger.debug(f"Returning SSE event queue for task {task_id_params.id}")
+            return self.dequeue_events_for_sse(
+                request.id, task_id_params.id, sse_event_queue
+            )
+        except Exception as e:
+            logger.error(f"Error while reconnecting to SSE stream: {e}")
+            logger.debug(f"Exception details for task resubscription {task_id_params.id}: {traceback.format_exc()}")
+            return JSONRPCResponse(
+                id=request.id,
+                error=InternalError(
+                    message=f"An error occurred while reconnecting to stream: {e}"
+                ),
+            )

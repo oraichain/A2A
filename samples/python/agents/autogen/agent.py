@@ -352,11 +352,12 @@ class Agent:
                         code_executor=self.code_executor,
                         system_message=self.SYSTEM_INSTRUCTION,
                         description="Expert analyst who can execute code to navigate database, analyze data and provide insights",
-                        
                     )
                     orchestrator_agent = MagenticOneGroupChat(
-                        participants=[ code_executor_agent], model_client=self.model_client
+                        participants=[mcp_agent], model_client=self.model_client
                     )
+                    
+                    task = query
                     if self.memory_manager:
                         relevant_memories = self.memory_manager.relevant_memories(
                             session_id=session_id, query=query
@@ -364,23 +365,25 @@ class Agent:
                         logger.info(
                             f"Relevant memories: {relevant_memories} for session {session_id} at query {query}"
                         )
-                    task = query
-                    if self.memory_manager and len(relevant_memories) > 0:
-                        flatten_relevant_memories = "\n".join(
-                            [m["memory"] for m in relevant_memories]
-                        )
-                        task = f"Answer the user question considering the memories. Keep answers clear and concise. Memories:{flatten_relevant_memories}\n\nQuestion: {query}"
-                    self.sessions[session_id] = {
-                        "generator": orchestrator_agent.run_stream(task=task),
-                        "last_accessed": datetime.now(timezone.utc),
-                    }
-                    if self.memory_manager:
+                        
+                        if len(relevant_memories) > 0:
+                            flatten_relevant_memories = "\n".join(
+                                [m["memory"] for m in relevant_memories]
+                            )
+                            task = f"Answer the user question considering the memories. Keep answers clear and concise. Memories:{flatten_relevant_memories}\n\nQuestion: {query}"
+                            
                         self.memory_manager.add_memory(
                             session_id,
                             [
                                 {"role": "user", "content": query},
                             ],
                         )
+                        
+                    self.sessions[session_id] = {
+                        "generator": orchestrator_agent.run_stream(task=task),
+                        "last_accessed": datetime.now(timezone.utc),
+                    }
+                    
                 async with asyncio.timeout(self.timeout):
                     async for event in self.sessions[session_id]["generator"]:
                         async with self.session_lock:

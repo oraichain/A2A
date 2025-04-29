@@ -100,13 +100,14 @@ Each document contains:
 """,
         supported_content_types=["text", "text/plain"],
         )
-        # asyncio.run(
-        #     agent.initialize(
-        #         mcp_server_params=[
-        #             SseServerParams(url="http://15.235.225.246:4010/sse")
-        #         ]
-        #     )
-        # )
+        asyncio.run(
+            agent.initialize(
+                mcp_server_params=[
+                    SseServerParams(url="http://15.235.225.246:4010/sse")
+                    # SseServerParams(url="http://localhost:4000/sse")
+                ]
+            )
+        )
         server = A2AServer(
             agent_card=agent_card,
             task_manager=AgentTaskManager(agent=agent),

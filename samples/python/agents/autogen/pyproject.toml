@@ -1,7 +1,7 @@
 [project]
 name = "a2a-sample-agent-autogen"
 version = "0.1.0"
-description = "Sample Autogen-based Expense Reimbursement agent hosted as an A2A server." 
+description = "Sample Autogen-based Expense Reimbursement agent hosted as an A2A server."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "ollama>=0.4.8",
     "litellm>=1.60.0",
     "anthropic>=0.49.0",
+    "docker>=7.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

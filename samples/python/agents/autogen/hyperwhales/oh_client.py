@@ -2,6 +2,7 @@
 import asyncio
 from typing import AsyncGenerator
 from uuid import uuid4
+import argparse
 
 from common.client import A2ACardResolver, A2AClient
 from common.types import Message, SendTaskResponse, SendTaskStreamingResponse, Task, TaskArtifactUpdateEvent, TaskSendParams, TaskState, TaskStatusUpdateEvent
@@ -27,61 +28,64 @@ class A2AAgent:
         continue_loop = True
         streaming = self.card.capabilities.streaming
 
-        while continue_loop:
-            taskId = uuid4().hex
-            print('=========  starting a new task ======== ')
-            try:
-                async for task_response in self.send_task(
-                    streaming, taskId, messages
-                ):
-                    if task_response is None or task_response.result is None:
-                        continue
-                    result = task_response.result
-
-                    if isinstance(result, TaskStatusUpdateEvent):
-                        # TODO: We need a mechanism to store TaskStatusUpdateEvent, in case there's something wrong -> return everything so far / summarize the task so far.
-                        print(
-                            f"""Task state: {result.status.state}\n
-                            Task message: {result.status.message}"""
-                        )
-                        # yield A2ASendTaskUpdateObservation(
-                        #     agent_name=action.agent_name,
-                        #     task_update_event=result,
-                        #     content=result.model_dump_json(),
-                        # )
-                    elif isinstance(result, TaskArtifactUpdateEvent):
-                        # TODO: Need to verify the artifact's quality. It should be a quality summary of all the task status update events.
-                        # Worst case, it should be list of all the task status update events.
-                        # yield A2ASendTaskArtifactObservation(
-                        #     agent_name=action.agent_name,
-                        #     task_artifact_event=result,
-                        #     content=result.model_dump_json(),
-                        # )
-                        pass
-                    elif isinstance(result, Task):
-                        # yield A2ASendTaskResponseObservation(
-                        #     agent_name=action.agent_name,
-                        #     task=result,
-                        #     content=result.model_dump_json(),
-                        # )
-                        pass
-            except Exception as e:
-                print(f'Error sending task: {e}')
-                # we should handle error more gracefully.
-                # Eg: Keep all of the progress so far somewhere, and ask the user if they want to continue.
-            continue_loop = await self.send_task(
+        # while continue_loop:
+        taskId = uuid4().hex
+        print('=========  starting a new task ======== ')
+        try:
+            # TODO: only continue loop if the task is not completed.
+            continue_loop = False
+            async for task_response in self.send_task(
                 streaming, taskId, messages
-            )
+            ):
+                if task_response is None or task_response.result is None:
+                    continue
+                result = task_response.result
 
-            if self.history and continue_loop:
-                print('========= history ======== ')
-            # don't pass historyLength. By default get all history.
-                task_response = await self.client.get_task(
-                    {'id': taskId}
-                )
-                print(
-                    task_response.model_dump_json(include={'result': {'history': True}})
-                )
+                if isinstance(result, TaskStatusUpdateEvent):
+                    # TODO: We need a mechanism to store TaskStatusUpdateEvent, in case there's something wrong -> return everything so far / summarize the task so far.
+                    # print(
+                    #     f"""Task state: {result.status.state}\n
+                    #     Task message: {result.status.message}"""
+                    # )
+                    # yield A2ASendTaskUpdateObservation(
+                    #     agent_name=action.agent_name,
+                    #     task_update_event=result,
+                    #     content=result.model_dump_json(),
+                    # )
+                    pass
+                elif isinstance(result, TaskArtifactUpdateEvent):
+                    # TODO: Need to verify the artifact's quality. It should be a quality summary of all the task status update events.
+                    # Worst case, it should be list of all the task status update events.
+                    # yield A2ASendTaskArtifactObservation(
+                    #     agent_name=action.agent_name,
+                    #     task_artifact_event=result,
+                    #     content=result.model_dump_json(),
+                    # )
+                    print(
+                        f"""Task artifact: {result.model_dump_json(exclude_none=True)}"""
+                    )
+                    pass
+                elif isinstance(result, Task):
+                    # yield A2ASendTaskResponseObservation(
+                    #     agent_name=action.agent_name,
+                    #     task=result,
+                    #     content=result.model_dump_json(),
+                    # )
+                    pass
+        except Exception as e:
+            print(f'Error sending task: {e}')
+            # we should handle error more gracefully.
+            # Eg: Keep all of the progress so far somewhere, and ask the user if they want to continue.
+
+        # if self.history and continue_loop:
+        print('========= history ======== ')
+        # don't pass historyLength. By default get all history.
+        task_response = await self.client.get_task(
+            {'id': taskId}
+        )
+        print(
+            task_response.model_dump_json(exclude_none=True)
+        )
 
     async def send_task(
         self, streaming: bool, taskId: str, messages: list[str]
@@ -125,11 +129,17 @@ class A2AAgent:
             yield response
 
 if __name__ == '__main__':
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Run the A2A Agent with a custom prompt')
+    parser.add_argument('--prompt', type=str, help='Custom prompt to send to the agent')
+    args = parser.parse_args()
+    
     sessionId = "743712a8805942dc991d3e060b8753c0"
     a2a_server_url = 'http://localhost:10000'
     agent = A2AAgent(a2a_server_url=a2a_server_url, session=sessionId, history=True)
     
-    PROMPT_TO_TEST = """
+    # Default prompt if no argument is provided
+    DEFAULT_PROMPT = """
 You are a Perpetual Whales Agent agent who is an expert analyst specializing in detecting whale trading patterns with years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies.
 
     You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
@@ -142,6 +152,10 @@ You are a Perpetual Whales Agent agent who is an expert analyst specializing in 
     - Analyze market trend based on 30 days of tokens
     - Define short-term trades as many as possible that can be executed with safety scoring and entries, stop loss, take profit, concise description, bias including short-term or long-term trades. The entries should be closest to latest price, stop loss and take profit should be realistic which is not too far from entry.
 
-    Write report into a md file and remain the wallet address for checking instead of shorting it
+    Summarize your final report, and send it to me via plain text final artifact.
 """
-    asyncio.run(agent.step([PROMPT_TO_TEST]))
+    
+    # Use the provided prompt or the default one
+    prompt = args.prompt if args.prompt else DEFAULT_PROMPT
+    
+    asyncio.run(agent.step([prompt]))
