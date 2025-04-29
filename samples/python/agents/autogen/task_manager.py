@@ -28,7 +28,6 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
-
 class AgentTaskManager(InMemoryTaskManager):
     def __init__(self, agent: Agent):
         super().__init__()
@@ -56,13 +55,28 @@ class AgentTaskManager(InMemoryTaskManager):
 
                 if is_task_complete:
                     task_state = TaskState.COMPLETED
+                    task = self.tasks[task_send_params.id]
+                    # FIXME: appropriately get all history from the task. Preferably from a database.
+                    history = self.append_task_history(task, 1000)
+                    if history:
+                        parts.append({
+                            "type": "text",
+                            "text": history.model_dump_json(exclude_none=True, include={"history"}),
+                        })
                     artifact = Artifact(parts=parts, index=0, append=False)
                     end_stream = True
                 elif not is_task_complete and not require_user_input:
                     task_state = TaskState.WORKING
                     message = Message(role="agent", parts=parts)
                 elif require_user_input:
+                    # FIXME: appropriately get all history from the task. Preferably from a database.
                     task_state = TaskState.INPUT_REQUIRED
+                    history = self.append_task_history(task, 1000)
+                    if history:
+                        parts.append({
+                            "type": "text",
+                            "text": history.model_dump_json(exclude_none=True, include={"history"}),
+                        })
                     message = Message(role="agent", parts=parts)
                     end_stream = True
 

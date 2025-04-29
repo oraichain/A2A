@@ -2,3 +2,4 @@
 __pycache__
 .env
 qdrant_storage
+coding/
