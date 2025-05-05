@@ -77,16 +77,6 @@ class A2AAgent:
             # we should handle error more gracefully.
             # Eg: Keep all of the progress so far somewhere, and ask the user if they want to continue.
 
-        # if self.history and continue_loop:
-        print('========= history ======== ')
-        # don't pass historyLength. By default get all history.
-        task_response = await self.client.get_task(
-            {'id': taskId}
-        )
-        print(
-            task_response.model_dump_json(exclude_none=True)
-        )
-
     async def send_task(
         self, streaming: bool, taskId: str, messages: list[str]
     ) -> AsyncGenerator[SendTaskStreamingResponse | SendTaskResponse, None]:

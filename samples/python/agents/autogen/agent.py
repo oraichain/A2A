@@ -1,3 +1,4 @@
+import json
 import os
 import asyncio
 import logging
@@ -5,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import re
 from agents.autogen.memory_manager import MemoryManager
+import aiofiles
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -18,11 +20,14 @@ from autogen_agentchat.messages import (
 from autogen_agentchat.base import TaskResult
 from autogen_core import Image
 from autogen_core.models import RequestUsage
-from typing import AsyncIterable, Dict, Any, TypedDict, AsyncGenerator, Tuple, List
+from typing import AsyncIterable, Dict, Any, Mapping, TypedDict, AsyncGenerator, Tuple, List, override
 from datetime import timezone
+from common.types import FileContent, FilePart, TextPart
 from litellm import completion_cost
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
+from autogen_agentchat.base import TerminationCondition
+from autogen_agentchat.conditions import ExternalTermination
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +37,40 @@ class SessionData(TypedDict):
     generator: AsyncGenerator[BaseAgentEvent | BaseChatMessage | TaskResult, None]
     last_accessed: datetime
 
+class MagenticOneGroupChatWithPersistState(MagenticOneGroupChat):
+    def __init__(self, *args, **kwargs):
+        self.session_id = kwargs.get("session_id", None)
+        self.task_id = kwargs.get("task_id", None)
+        if not self.session_id or not self.task_id:
+            raise ValueError("session_id and task_id are required")
+        del kwargs["session_id"]
+        del kwargs["task_id"]
+        super().__init__(*args, **kwargs)
+        self.base_path = f"{os.getcwd()}/agents/autogen/hyperwhales/sessions/{self.session_id}/tasks/{self.task_id}"
+
+    @override
+    async def save_state(self):
+        state = await super().save_state()
+        await asyncio.to_thread(
+            os.makedirs,
+            os.path.dirname(f"{self.base_path}/agent_state.json"),
+            exist_ok=True
+            )
+        async with aiofiles.open(f"{self.base_path}/agent_state.json", "w") as f:
+            await f.write(json.dumps(state))
+            await f.flush()
+        logger.info(f"Saved orchestrator state for session {self.session_id} and task {self.task_id}")
+        return state
+    
+    async def load_state(self):
+        if not os.path.exists(f"{self.base_path}/agent_state.json"):
+            return None
+        async with aiofiles.open(f"{self.base_path}/agent_state.json", "r") as f:
+            state_str = await f.read()
+            state = json.loads(state_str)
+            await super().load_state(state)
+        logger.info(f"Loaded orchestrator state for session {self.session_id} and task {self.task_id}")
+        return state
 
 class Agent:
     def __init__(
@@ -168,7 +207,7 @@ class Agent:
             f"Accumulated Cost=${self.session_token_metrics[session_id]['accumulated_cost']:.6f}"
         )
 
-    async def process_event(self, event, session_id: str) -> Dict[str, Any]:
+    async def process_event(self, event, session_id: str, orchestrator_agent: MagenticOneGroupChat | None = None) -> Dict[str, Any]:
         try:
             if isinstance(event, BaseAgentEvent):
                 content, images = self.extract_message_content(event)
@@ -183,6 +222,7 @@ class Agent:
                     "images": images,
                 }
             elif isinstance(event, TaskResult):
+                content, images = self.extract_task_result_content(event)
                 async with self.session_lock:
                     logger.info(f"TaskResult event model usages in all messages: {[msg.models_usage for msg in event.messages]}")
                     await self.sessions[session_id]["generator"].aclose()
@@ -212,30 +252,25 @@ class Agent:
                                 ],
                             )
 
-                content = self.extract_task_result_content(event)
-                images = []
-                if len(event.messages) > 0:
-                    last_message = event.messages[-1]
-                    content_text, content_images = self.extract_message_content(
-                        last_message
-                    )
-                    content = content_text
-                    images = content_images
-
-                return {
-                    "is_task_complete": True,
-                    "require_user_input": False,
-                    "model_usage": None,
-                    "content": content,
-                    "images": images,
-                }
+                    if orchestrator_agent:
+                        await orchestrator_agent.save_state()
+                        
+                    return {
+                        "is_task_complete": True,
+                        "require_user_input": False,
+                        "model_usage": None,
+                        "content": content,
+                        "images": images,
+                    }
             elif isinstance(event, BaseChatMessage):
                 content, images = self.extract_message_content(event)
                 model_usage = event.models_usage
                 if model_usage:
                     self.accumulate_token_metrics(session_id, model_usage)
                     
-                print(f"content: {content}", f"images: {images}")
+                logger.info(f"================= content =================")
+                logger.info(content)
+                logger.info(f"================= content =================")
                 return {
                     "is_task_complete": False,
                     "require_user_input": False,
@@ -292,45 +327,53 @@ class Agent:
     @staticmethod
     def extract_message_content(
         message: BaseAgentEvent | BaseChatMessage,
-    ) -> Tuple[str, List[str]]:
+    ) -> Tuple[List[TextPart], List[FilePart]]:
+        text_parts: List[TextPart] = []
+        image_parts: List[FilePart] = []
         if isinstance(message, MultiModalMessage):
-            text_parts = [item for item in message.content if isinstance(item, str)]
+            text_parts = [TextPart(type="text", text=item) for item in message.content if isinstance(item, str)]
             image_parts = [
-                item.to_base64() for item in message.content if isinstance(item, Image)
+                FilePart(type="file", file=FileContent(uri=item.data_uri)) for item in message.content if isinstance(item, Image)
             ]
         elif isinstance(message, BaseChatMessage):
-            text_parts = [message.to_model_text()]
+            text_parts = [TextPart(type="text", text=message.to_model_text())]
             image_parts = []
         else:
-            text_parts = [message.to_text()]
+            text_parts = [TextPart(type="text", text=message.to_text())]
             image_parts = []
-        return "\n".join(text_parts), image_parts
+        return text_parts, image_parts
 
     @staticmethod
-    def extract_task_result_content(message: TaskResult) -> str:
-        output = (
-            f"Number of messages: {len(message.messages)}\n"
-            f"Finish reason: {message.stop_reason}\n"
-        )
-        return output
+    def extract_task_result_content(messages: TaskResult) -> Tuple[List[TextPart], List[FilePart]]:
+        text_parts: List[TextPart] = []
+        image_parts: List[FilePart] = []
+        for message in messages.messages:
+            sub_text_parts, sub_image_parts = Agent.extract_message_content(message)
+            text_parts.extend(sub_text_parts)
+            image_parts.extend(sub_image_parts)
+        return text_parts, image_parts
 
     async def stream(
-        self, query: str, session_id: str
+        self, query: str, task_id: str, session_id: str
     ) -> AsyncIterable[Dict[str, Any]]:
         logger.info(f"Starting stream for session {session_id} with query: {query}")
         async with self.semaphore:
+            mcp_agent: AssistantAgent | None = None
+            termination_condition: ExternalTermination | None = None
+            orchestrator_agent: MagenticOneGroupChat | None = None
             try:
-                # Check if we have an existing agent for this session
-                async with self.session_lock:
-                    mcp_agent = AssistantAgent(
+                mcp_agent = AssistantAgent(
                         name=self.LABEL,
                         model_client=self.model_client,
                         tools=self.tools,
                         system_message=self.SYSTEM_INSTRUCTION,
                     )
-                    orchestrator_agent = MagenticOneGroupChat(
-                        participants=[mcp_agent], model_client=self.model_client
-                    )
+                termination_condition = ExternalTermination()
+                orchestrator_agent = MagenticOneGroupChatWithPersistState(
+                    participants=[mcp_agent], model_client=self.model_client, session_id=session_id, task_id=task_id, termination_condition=termination_condition
+                )
+                # Check if we have an existing agent for this session
+                async with self.session_lock:
                     if self.memory_manager:
                         relevant_memories = self.memory_manager.relevant_memories(
                             session_id=session_id, query=query
@@ -355,13 +398,12 @@ class Agent:
                                 {"role": "user", "content": query},
                             ],
                         )
-                async with asyncio.timeout(self.timeout):
-                    async for event in self.sessions[session_id]["generator"]:
-                        async with self.session_lock:
-                            self.sessions[session_id]["last_accessed"] = datetime.now(
-                                timezone.utc
-                            )
-                        yield await self.process_event(event, session_id)
+                async for event in self.sessions[session_id]["generator"]:
+                    async with self.session_lock:
+                        self.sessions[session_id]["last_accessed"] = datetime.now(
+                            timezone.utc
+                        )
+                    yield await self.process_event(event, session_id, orchestrator_agent)
             except asyncio.TimeoutError:
                 logger.warning(f"Stream for session {session_id} timed out")
                 async with self.session_lock:
@@ -376,6 +418,11 @@ class Agent:
             except Exception as e:
                 logger.error(f"Error in stream for session {session_id}: {e}")
                 async with self.session_lock:
+                    # save state for retry if needed
+                    if orchestrator_agent:
+                        logger.error(f"Saving state for orchestrator agent runtime error with task id {task_id}")
+                        await orchestrator_agent.save_state()
+                        
                     if session_id in self.sessions:
                         await self.sessions[session_id]["generator"].aclose()
                         del self.sessions[session_id]
@@ -385,4 +432,10 @@ class Agent:
                     "content": f"Error: {str(e)}",
                 }
             finally:
-                logger.info(f"Stream for session {session_id} completed")
+                try:
+                    if termination_condition and orchestrator_agent:
+                        termination_condition.set()
+                        await orchestrator_agent.reset()
+                        logger.info(f"Stream for session {session_id} and task {task_id} completed")
+                except Exception as e:
+                    logger.error(f"Error in stopping the orchestrator agent for session {session_id} and task {task_id}: {e}")
