@@ -5,3 +5,4 @@ qdrant_storage
 coding/
 tasks/
 .vscode/
+.chromadb_autogen/

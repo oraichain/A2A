@@ -6,6 +6,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import re
 from agents.autogen.memory_manager import MemoryManager
+from agents.summary_agent import SummaryAgent
+from agents.tool_call_agent import ToolCallAgent
 import aiofiles
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import MagenticOneGroupChat
@@ -20,14 +22,16 @@ from autogen_agentchat.messages import (
 from autogen_agentchat.base import TaskResult
 from autogen_core import Image
 from autogen_core.models import RequestUsage
+# from autogen_core.model_context import HeadAndTailChatCompletionContext
 from typing import AsyncIterable, Dict, Any, Mapping, TypedDict, AsyncGenerator, Tuple, List, override
 from datetime import timezone
 from common.types import FileContent, FilePart, TextPart
 from litellm import completion_cost
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
-from autogen_agentchat.base import TerminationCondition
 from autogen_agentchat.conditions import ExternalTermination
+from autogen_core.memory import ListMemory
+from autogen_ext.models.cache import ChatCompletionCache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,7 +50,8 @@ class MagenticOneGroupChatWithPersistState(MagenticOneGroupChat):
         del kwargs["session_id"]
         del kwargs["task_id"]
         super().__init__(*args, **kwargs)
-        self.base_path = f"{os.getcwd()}/agents/autogen/hyperwhales/sessions/{self.session_id}/tasks/{self.task_id}"
+        root_path = os.getenv("ROOT_PATH", os.getcwd())
+        self.base_path = f"{root_path}/agents/autogen/hyperwhales/sessions/{self.session_id}/tasks/{self.task_id}"
 
     @override
     async def save_state(self):
@@ -62,7 +67,8 @@ class MagenticOneGroupChatWithPersistState(MagenticOneGroupChat):
         logger.info(f"Saved orchestrator state for session {self.session_id} and task {self.task_id}")
         return state
     
-    async def load_state(self):
+    @override
+    async def load_state(self, _: Mapping[str, Any]):
         if not os.path.exists(f"{self.base_path}/agent_state.json"):
             return None
         async with aiofiles.open(f"{self.base_path}/agent_state.json", "r") as f:
@@ -113,9 +119,9 @@ class Agent:
         if not api_key or not model:
             raise ValueError("API_KEY or LLM_MODEL not set")
         if re.match(r"^claude", model):
-            self.model_client = AnthropicChatCompletionClient(model=model, api_key=api_key)
+            self.model_client = AnthropicChatCompletionClient(model=model, api_key=api_key, temperature=0.4)
         else:
-            self.model_client = OpenAIChatCompletionClient(model=model, api_key=api_key)
+            self.model_client = OpenAIChatCompletionClient(model=model, api_key=api_key, temperature=0.4)
         # FIXME: This is a hack to get the model name. With autogen, there could be multiple models in the config.
         self.model_name = model
         self.tools = []
@@ -203,7 +209,7 @@ class Agent:
         logger.info(
             f"Token Metrics for session {session_id}: Prompt Tokens={model_usage.prompt_tokens}, "
             f"Completion Tokens={model_usage.completion_tokens}, "
-            f"Cumulative Total={self.session_token_metrics[session_id]['total_tokens']}"
+            f"Cumulative Total={self.session_token_metrics[session_id]['total_tokens']} "
             f"Accumulated Cost=${self.session_token_metrics[session_id]['accumulated_cost']:.6f}"
         )
 
@@ -359,19 +365,42 @@ class Agent:
         logger.info(f"Starting stream for session {session_id} with query: {query}")
         async with self.semaphore:
             mcp_agent: AssistantAgent | None = None
+            summary_agent: AssistantAgent | None = None
             termination_condition: ExternalTermination | None = None
             orchestrator_agent: MagenticOneGroupChat | None = None
+            list_memory = ListMemory(
+                name=f"simple_shared_memory",
+            )
             try:
-                mcp_agent = AssistantAgent(
+                mcp_agent = ToolCallAgent(
                         name=self.LABEL,
                         model_client=self.model_client,
                         tools=self.tools,
                         system_message=self.SYSTEM_INSTRUCTION,
+                        description=self.SYSTEM_INSTRUCTION,
+                        list_memory=list_memory,
+                        tool_call_summary_format="""
+                        \n
+                        <tool_call_result>
+                        tool_name: {tool_name},
+                        arguments: {arguments},
+                        result: {result}
+                        </tool_call_result>
+                        \n
+                        """,
                     )
+                summary_agent = SummaryAgent(
+                    name="SummaryAgent",
+                    model_client=self.model_client,
+                    tools=[],
+                    system_message="",
+                    list_memory=list_memory,
+                )
                 termination_condition = ExternalTermination()
                 orchestrator_agent = MagenticOneGroupChatWithPersistState(
-                    participants=[mcp_agent], model_client=self.model_client, session_id=session_id, task_id=task_id, termination_condition=termination_condition
+                    participants=[mcp_agent, summary_agent], model_client=self.model_client, session_id=session_id, task_id=task_id, 
                 )
+                await orchestrator_agent.load_state(None)
                 # Check if we have an existing agent for this session
                 async with self.session_lock:
                     if self.memory_manager:
@@ -434,8 +463,8 @@ class Agent:
             finally:
                 try:
                     if termination_condition and orchestrator_agent:
-                        termination_condition.set()
-                        await orchestrator_agent.reset()
+                        # termination_condition.set()
+                        # await orchestrator_agent.reset()
                         logger.info(f"Stream for session {session_id} and task {task_id} completed")
                 except Exception as e:
                     logger.error(f"Error in stopping the orchestrator agent for session {session_id} and task {task_id}: {e}")
