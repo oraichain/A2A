@@ -1,5 +1,6 @@
-from typing import AsyncIterable
+from typing import AsyncIterable, List
 from common.types import (
+    FilePart,
     SendTaskRequest,
     TaskSendParams,
     Message,
@@ -38,45 +39,24 @@ class AgentTaskManager(InMemoryTaskManager):
         query = self._get_user_query(task_send_params)
 
         try:
-            async for item in self.agent.stream(query, task_send_params.sessionId):
+            async for item in self.agent.stream(query, task_id=task_send_params.id, session_id=task_send_params.sessionId):
                 is_task_complete = item["is_task_complete"]
                 require_user_input = item["require_user_input"]
                 artifact = None
                 message = None
-                parts = [
-                    {
-                        "type": "text",
-                        "text": item["content"],
-                        "images": item["images"],
-                        "model_usage": item.get("model_usage", None),
-                    }
-                ]
+                text_parts: List[TextPart] = item["content"]
+                image_parts: List[FilePart] = item["images"]
+                parts = text_parts + image_parts
                 end_stream = False
 
                 if is_task_complete:
                     task_state = TaskState.COMPLETED
-                    task = self.tasks[task_send_params.id]
-                    # FIXME: appropriately get all history from the task. Preferably from a database.
-                    history = self.append_task_history(task, 1000)
-                    if history:
-                        parts.append({
-                            "type": "text",
-                            "text": history.model_dump_json(exclude_none=True, include={"history"}),
-                        })
                     artifact = Artifact(parts=parts, index=0, append=False)
                     end_stream = True
                 elif not is_task_complete and not require_user_input:
                     task_state = TaskState.WORKING
                     message = Message(role="agent", parts=parts)
                 elif require_user_input:
-                    # FIXME: appropriately get all history from the task. Preferably from a database.
-                    task_state = TaskState.INPUT_REQUIRED
-                    history = self.append_task_history(task, 1000)
-                    if history:
-                        parts.append({
-                            "type": "text",
-                            "text": history.model_dump_json(exclude_none=True, include={"history"}),
-                        })
                     message = Message(role="agent", parts=parts)
                     end_stream = True
 

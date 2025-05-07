@@ -77,16 +77,6 @@ class A2AAgent:
             # we should handle error more gracefully.
             # Eg: Keep all of the progress so far somewhere, and ask the user if they want to continue.
 
-        # if self.history and continue_loop:
-        print('========= history ======== ')
-        # don't pass historyLength. By default get all history.
-        task_response = await self.client.get_task(
-            {'id': taskId}
-        )
-        print(
-            task_response.model_dump_json(exclude_none=True)
-        )
-
     async def send_task(
         self, streaming: bool, taskId: str, messages: list[str]
     ) -> AsyncGenerator[SendTaskStreamingResponse | SendTaskResponse, None]:
@@ -151,8 +141,16 @@ You are a Perpetual Whales Agent agent who is an expert analyst specializing in 
     - Risk assessment of all current positions
     - Analyze market trend based on 30 days of tokens
     - Define short-term trades as many as possible that can be executed with safety scoring and entries, stop loss, take profit, concise description, bias including short-term or long-term trades. The entries should be closest to latest price, stop loss and take profit should be realistic which is not too far from entry.
+    
+    Identify and extract key DeFi metrics from each tool call result, such as:
+    - Protocol or platform names
+    - Total value locked (TVL) in USD
+    - Transaction volumes or counts
+    - Yield rates or APYs
+    - Token prices or market data
+    - Other relevant DeFi-specific metrics
 
-    Summarize your final report, and send it to me via plain text final artifact.
+    Summarize your final report as detailed as possible. Make it from 5 to 10 paragraphs. Remember to be very specific and precise about the metrics and numbers.
 """
     
     # Use the provided prompt or the default one
