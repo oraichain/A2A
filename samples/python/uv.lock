@@ -75,6 +75,7 @@ dependencies = [
     { name = "langchain-google-genai" },
     { name = "langchain-mcp-adapters" },
     { name = "langgraph" },
+    { name = "litellm" },
     { name = "pydantic" },
     { name = "python-dotenv" },
 ]
@@ -89,6 +90,7 @@ requires-dist = [
     { name = "langchain-google-genai", specifier = ">=2.0.10" },
     { name = "langchain-mcp-adapters", specifier = ">=0.0.10" },
     { name = "langgraph", specifier = ">=0.3.18" },
+    { name = "litellm", specifier = ">=1.60.0" },
     { name = "pydantic", specifier = ">=2.10.6" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
 ]
