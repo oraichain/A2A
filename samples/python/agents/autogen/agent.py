@@ -5,7 +5,8 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 import re
-from agents.autogen.memory_manager import MemoryManager
+# from agents.autogen.memory_manager import MemoryManager
+# from agents.optimized_orchestrator import MagenticOneGroupChatWithPersistState
 from agents.summary_agent import SummaryAgent
 from agents.tool_call_agent import ToolCallAgent
 import aiofiles
@@ -82,7 +83,6 @@ class Agent:
     def __init__(
         self,
         label: str,
-        system_instruction: str,
         supported_content_types: list[str] = ["text", "text/plain"],
         timeout: int = 900,
         max_concurrent_tasks: int = 10,
@@ -90,7 +90,6 @@ class Agent:
         use_memory: bool = False,
     ):
         self.LABEL = label
-        self.SYSTEM_INSTRUCTION = system_instruction
         self.SUPPORTED_CONTENT_TYPES = supported_content_types
         self.model_client = None
         self.mcp_agent = None
@@ -105,7 +104,8 @@ class Agent:
         self.max_concurrent_tasks = max_concurrent_tasks
         self.semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
         if use_memory:
-            self.memory_manager = MemoryManager(label, in_mem_vector_store)
+            # self.memory_manager = MemoryManager(label, in_mem_vector_store)
+            pass
         else:
             self.memory_manager = None
         
@@ -376,8 +376,7 @@ class Agent:
                         name=self.LABEL,
                         model_client=self.model_client,
                         tools=self.tools,
-                        system_message=self.SYSTEM_INSTRUCTION,
-                        description=self.SYSTEM_INSTRUCTION,
+                        system_message="",
                         list_memory=list_memory,
                         tool_call_summary_format="""
                         \n

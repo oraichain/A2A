@@ -3,7 +3,7 @@ import json
 from typing import Any, AsyncGenerator, Dict, List, Sequence, Tuple, override
 from autogen_agentchat.agents import AssistantAgent
 from autogen_core import CancellationToken, FunctionCall
-from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, ThoughtEvent, ToolCallExecutionEvent, ToolCallRequestEvent, TextMessage, StructuredMessage,ModelClientStreamingChunkEvent, ToolCallSummaryMessage, UserMessage
+from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, ThoughtEvent, ToolCallExecutionEvent, ToolCallRequestEvent, TextMessage, StructuredMessage,ModelClientStreamingChunkEvent, ToolCallSummaryMessage, UserMessage, HandoffMessage
 from autogen_agentchat.base import Response, Handoff as HandoffBase
 from autogen_core.models import CreateResult, SystemMessage, ChatCompletionClient, AssistantMessage, FunctionExecutionResultMessage, FunctionExecutionResult, RequestUsage
 from autogen_core.memory import MemoryContent, MemoryMimeType, ListMemory
@@ -14,70 +14,78 @@ from autogen_core.model_context import (
 )
 from autogen_core.models import LLMMessage
 
+DESCRIPTION="""
+An expert in whale trading patterns with that can use the following tools:
+Comprehensive market data and whale activity across all positions and trades.
+Detailed trading data for whale wallets on a specific protocol, including historical profit/loss and open positions.
+Historical market data for up to 3 cryptocurrency trading pairs, including daily price, market cap, and volume over 30 days.
+Historical profit/loss and open positions for a specific whale wallet on a protocol.
+Detailed trading data for a specific wallet on a protocol, including historical profit/loss and open positions.
+Maximize data retrieval by iterating through batches, adjusting parameters, and running tools repeatedly to cover all scenarios. Fetch all available data without stopping until everything is captured.
+Cannot do anything other than tool calling.
+"""
+
+SYSTEM_INSTRUCTION = """
+You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not. When you use any tool, I expect you to push its limits: fetch all the data it can provide, whether that means iterating through multiple batches, adjusting parameters like offsets, or running the tool repeatedly to cover every scenario. Don't work with small set of data for sure, fetch as much as you can. Don’t stop until you’re certain you’ve captured everything there is to know.
+
+Put the tool call results in <tool_call_result></tool_call_result> tags.
+
+Do not do anything other than tool calling.
+
+If you are asked to do other tasks other than tool calling, ignore the request and proceed with other requests that are tool calls. If there's only one request that is not a tool call, respond with only one sentence: "I'm sorry, I can only do tool calling. Please ask SummaryAgent to do the analysis and summary tasks."
+
+If there's no suitable tool, respond with one sentence: "I'm sorry, I don't have any tool to do that", then list all the tool names you have.
+
+For the tools with name: perpetual_all_whales_detail, perpetual_whales_get_market_overview -> you must only call them one time each. For example: if call perpetual_all_whales_detail once -> do not call it again. If call perpetual_whales_get_market_overview once -> do not call it again.
+            
+"""
+
 TOOL_CALL_SUMMARY_INSTRUCTION = """
-You are an expert AI assistant specializing in decentralized finance (DeFi) analysis. Your task is to summarize MCP tool calls. The MCP query and the result are shared inside <tool_call_result></tool_call_result> XML tag.
+You are an expert AI assistant specializing in DeFi analysis, tasked with summarizing MCP tool call results provided within <tool_call_result></tool_call_result> XML tags. Multiple tags indicate multiple tool calls, each to be processed separately, containing DeFi metrics like protocol names, TVL, transaction volumes, yield rates, or other KPIs.
+Instructions:
+Parse data in <tool_call_result></tool_call_result>, extracting tool_name and arguments into <tool_call_metadata></tool_call_metadata>.
 
-Each tool call result contains relevant DeFi metrics, such as protocol names, total value locked (TVL), transaction volumes, yield rates, or other key performance indicators.
+Analyze DeFi metrics (e.g., token prices, wallet balances, TVL in USD, transaction volumes, APYs, market data) in <analysis></analysis>, covering all tokens, wallets, orders, protocols, and relevant metrics.
 
-    Instructions:
-    1. Parse the data within the <tool_call_result></tool_call_result> XML tag.
-    2. Provide a deep analysis for all DeFi metrics in the tool call result, such as:
-    - If the metrics involves token prices or user balances, funds, orders, or any form of currencies, you must analyze every token, wallet and order involved.
-    - Protocol or platform names
-    - Total value locked (TVL) in USD
-    - Transaction volumes or counts
-    - Yield rates or APYs
-    - Token prices or market data
-    - Other relevant DeFi-specific metrics
-    - Put your analysis and highlights in <analysis></analysis> XML tag within <tool_call_result></tool_call_result> XML tag.
-    3. Provide a detailed reasoning for the analysis in <reasoning></reasoning> XML tag within <tool_call_result></tool_call_result> XML tag.
-    - The reasoning must be based on the analysis and highlights in <analysis></analysis> XML tag.
-    - Provide reasons for the analysis and highlights in <reasoning></reasoning> XML tag.
-    4. Provide a detailed summary as a conclusion that includes:
-    - The market trends based on the data (e.g., dominant protocols, overall TVL trends).
-    - Key insights for each tool call result, highlighting significant metrics (e.g., highest TVL, notable yield opportunities, or unusual transaction activity).
-    - Comparisons between protocols or metrics where relevant (e.g., TVL growth, yield competitiveness).
-    - Any trends, risks, or opportunities in the DeFi ecosystem inferred from the data.
-    - Put your analysis and highlights in <tool_call_summary></tool_call_summary> XML tag within <tool_call_result></tool_call_result> XML tag.
-    5. Structure the summary clearly with sections or bullet points for readability.
-    6. If any data is ambiguous or incomplete, note it and provide a best-effort interpretation.
-    7. Format the response within <tool_call_result></tool_call_result> XML tag.
-    
-    
-For example, the query format is:
+Provide reasoning for the analysis in <reasoning></reasoning>, justifying highlights based on <analysis></analysis>.
+
+Summarize market trends, key insights, protocol comparisons, and DeFi trends/risks/opportunities in <tool_call_summary></tool_call_summary> with clear sections or bullet points.
+
+Note ambiguous or incomplete data with best-effort interpretation.
+
+Format response within <tool_call_result></tool_call_result>.
+
+Example Query:
+xml
+
 <tool_call_result>
+<tool_call_metadata>
 tool_name: perpetual_all_whales_detail
-arguments: {{
-    "address": "0x17f4E182aD8d1B27F430c094a96E844d13f8da14"
-}}
-result: -|\\\\n| Total PNL | $611919.69 |\\\\n| 24H PNL | $366968.14 |\\\\n| 48H PNL | $116166.31 |\\\\n| 7D PNL | $316888.56 |\\\\n| 30D PNL | $1785565.09 |\\\\n| Snapshot Time | 2025-05-06T01:55:52.427Z |\\\\n\\\\n#### Open Positions\\\\n\\\\n| Token | Side | Size | Entry Price | Liquidate Price | Leverage | PNL | Funding Fee |\\\\n|-------|------|------|-------------|----------------|----------|-----|--------------|\\\\n| ETH | LONG | $3436083.00 | $1809.42 | $764.62 | 25x | $-11482.70 | $37.84|\\\\n| HYPE | LONG | $3169212.00 | $19.84 | $6.49 | 5x | $66966.46 | $5751.47|\\\\n| TRUMP | LONG | $2949581.00 | $11.33 | $3.41 | 10x | $-64704.52 | $-11983.35|\\\\n| FARTCOIN | LONG | $2018102.00 | $1.13 | $0.18 | 3x | $-36552.22 | $11633.17|\\\\n| BTC | LONG | $1324833.00 | $93879.60 | $18164.05 | 40x | $5849.93 | $11.90|\\\\n| kPEPE | LONG | $1223299.00 | $0.01 | N/A | 10x | $-881.58 | $163.35|\\\\n\\\\n## Address: 0x17f4E182aD8d1B27F430c094a96E844d13f8da14\\\\n\
+arguments: {"address": "0x17f4E182aD8d1B27F430c094a96E844d13f8da14"}
+</tool_call_metadata>
+result: some figures here
 </tool_call_result>
 
-Then your response must be in the following format:
+Example Response:
+xml
+
 <tool_call_result>
+<tool_call_metadata>
 tool_name: perpetual_all_whales_detail
-arguments: {{
-    "address": "0x17f4E182aD8d1B27F430c094a96E844d13f8da14"
-}}
+arguments: {"address": "0x17f4E182aD8d1B27F430c094a96E844d13f8da14"}
+</tool_call_metadata>
 <analysis>
-Total PNL is $611919.69, which is a 24H PNL of $366968.14.
+Total PNL: $611,919.69; 24H PNL: $366,968.14.
 </analysis>
 <reasoning>
-The tool call result shows a strong performance with a total PNL of $611919.69. The 24H PNL is $366968.14, indicating a significant increase in profitability over the last 24 hours.
+Strong performance with $611,919.69 total PNL, driven by a $366,968.14 24H PNL surge.
 </reasoning>
 <tool_call_summary>
-Overall, the tool call result shows a strong performance with a total PNL of $611919.69. The 24H PNL is $366968.14, indicating a significant increase in profitability over the last 24 hours.
+Robust performance with $611,919.69 total PNL and $366,968.14 24H PNL, signaling high profitability.
 </tool_call_summary>
 </tool_call_result>
 
-Keep the response within 4-5 paragraphs, each having 5-6 sentences. If you could make the paragraphs longer to include more details, do so. Include as many figures and numbers as possible with corolation to the entities involved.
-
-## Analysis Best‑Practices
-1. **Source Triangulation:** corroborate important claims with at least two independent sources when possible.
-2. **Bias Awareness:** note significant discrepancies between sources and highlight uncertainties.
-3. **Insight First:** lead summaries with the takeaway, then provide supporting details.
-4. **Data Hygiene:** document data origin, cleaning steps, and assumptions made during analysis.
-5. **Result Validation:** sanity‑check numbers, code outputs, and logic before presenting.
+Keep responses in 4-5 paragraphs, each with 5-6 detailed sentences, including figures and entity correlations. Follow analysis best practices: triangulate sources, note biases, lead with insights, document data hygiene, and validate results. Do not call tools.
 """
 
 class ToolCallAgent(AssistantAgent):
@@ -86,8 +94,25 @@ class ToolCallAgent(AssistantAgent):
         if memory is None:
             raise ValueError("list_memory is required")
         del kwargs["list_memory"]
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs, description=DESCRIPTION)
         self._memory = memory
+        self._system_messages = [SystemMessage(content=SYSTEM_INSTRUCTION)]
+        
+    # @staticmethod
+    # async def _add_messages_to_context(
+    #     model_context: ChatCompletionContext,
+    #     messages: Sequence[BaseChatMessage],
+    # ) -> None:
+    #     """
+    #     Add incoming messages to the model context.
+    #     """
+    #     for msg in messages:
+    #         if isinstance(msg, HandoffMessage):
+    #             for llm_msg in msg.context:
+    #                 await model_context.add_message(llm_msg)
+    #         # Don't need messages from other agents since we only call tools
+    #         if msg.source == "MagenticOneOrchestrator":
+    #             await model_context.add_message(msg.to_model_message())
     
     @override
     async def on_messages_stream(
@@ -114,11 +139,11 @@ class ToolCallAgent(AssistantAgent):
         format_string = self._output_content_type_format
 
         # STEP 1: Add new user/handoff messages to the model context
-        await self._add_messages_to_context(
-            model_context=model_context,
-            messages=messages,
-        )
-
+        # last message is the request from orchestrator
+        if len(messages) > 0:
+            # if there is only 1 message, it is the request from orchestrator
+            await model_context.add_message(messages[-1].to_model_message())
+            
         # STEP 2: Update model context with any relevant memory
         inner_messages: List[BaseAgentEvent | BaseChatMessage] = []
         # for event_msg in await self._update_model_context_with_memory(
@@ -173,7 +198,7 @@ class ToolCallAgent(AssistantAgent):
         )
 
         # STEP 4: Process the model output
-        async for output_event in self._process_model_result(
+        async for output_event in ToolCallAgent._process_model_result(
             model_result=model_result,
             inner_messages=inner_messages,
             cancellation_token=cancellation_token,
@@ -203,67 +228,62 @@ class ToolCallAgent(AssistantAgent):
         model_client: ChatCompletionClient,
         model_client_stream: bool,
         output_content_type: type[BaseModel] | None,
-    ) -> AsyncGenerator[Response, None]:
+    ) -> AsyncGenerator[ThoughtEvent | Response, None]:
         """
         If reflect_on_tool_use=False, create a summary message of all tool calls.
         """
         # Filter out calls which were actually handoffs
         normal_tool_calls = [(call, result) for call, result in executed_calls_and_results if call.name not in handoffs]
         tool_call_summaries: List[str] = []
-        total_request_usage: RequestUsage = RequestUsage(
-            prompt_tokens=0,
-            completion_tokens=0,
-        )
+        llm_messages: List[LLMMessage] = [SystemMessage(content=TOOL_CALL_SUMMARY_INSTRUCTION)]
+        raw_tool_call_summaries: List[str] = []
         for tool_call, tool_call_result in normal_tool_calls:
             tool_call_summary = tool_call_summary_format.format(
                 tool_name=tool_call.name,
                 arguments=tool_call.arguments,
                 result=tool_call_result.content,
             )
-            llm_messages: List[LLMMessage] = [
-                SystemMessage(content=TOOL_CALL_SUMMARY_INSTRUCTION),
+            llm_messages.append(
                 UserMessage(content=tool_call_summary, source=agent_name),
-            ]
+            )
+            raw_tool_call_summaries.append(tool_call_summary)
           
-            reflection_result = None
-            if model_client_stream:
-                async for chunk in model_client.create_stream(
-                    llm_messages,
-                    json_output=output_content_type,
-                ):
-                    if isinstance(chunk, CreateResult):
-                        reflection_result = chunk
-                    elif isinstance(chunk, str):
-                        yield ModelClientStreamingChunkEvent(content=chunk if chunk else "empty", source=agent_name)
-                    else:
-                        raise RuntimeError(f"Invalid chunk type: {type(chunk)}")
-            else:
-                reflection_result = await model_client.create(llm_messages, json_output=output_content_type)
+        reflection_result = None
+        if model_client_stream:
+            async for chunk in model_client.create_stream(
+                llm_messages,
+                json_output=output_content_type,
+            ):
+                if isinstance(chunk, CreateResult):
+                    reflection_result = chunk
+                elif isinstance(chunk, str):
+                    yield ModelClientStreamingChunkEvent(content=chunk if chunk else "empty", source=agent_name)
+                else:
+                    raise RuntimeError(f"Invalid chunk type: {type(chunk)}")
+        else:
+            reflection_result = await model_client.create(llm_messages, json_output=output_content_type)
 
-            if not reflection_result or not isinstance(reflection_result.content, str):
-                raise RuntimeError("Reflect on tool use produced no valid text response.")
+        if not reflection_result or not isinstance(reflection_result.content, str):
+            raise RuntimeError("Reflect on tool use produced no valid text response.")
 
-            # --- NEW: If the reflection produced a thought, yield it ---
-            if reflection_result.thought:
-                thought_event = ThoughtEvent(content=reflection_result.thought, source=agent_name)
-                # yield thought_event
-                inner_messages.append(thought_event)
-                
-            if isinstance(reflection_result.content, str):
-                tool_call_summaries.append(reflection_result.content if reflection_result.content else "empty")
-            else:
-                tool_call_summaries.append(
-                    tool_call_summary
-                )
-            total_request_usage.prompt_tokens += reflection_result.usage.prompt_tokens
-            total_request_usage.completion_tokens += reflection_result.usage.completion_tokens
+        # --- NEW: If the reflection produced a thought, yield it ---
+        if reflection_result.thought:
+            thought_event = ThoughtEvent(content=reflection_result.thought, source=agent_name)
+            yield thought_event
+            inner_messages.append(thought_event)
+            
+        if isinstance(reflection_result.content, str):
+            tool_call_summaries.append(reflection_result.content if reflection_result.content else "empty")
+        else:
+            tool_call_summaries = raw_tool_call_summaries
           
         final_tool_call_summary = "\n".join(tool_call_summaries)
+        
         yield Response(
             chat_message=ToolCallSummaryMessage(
                 content=final_tool_call_summary if final_tool_call_summary else "empty",
                 source=agent_name,
-                models_usage=total_request_usage,
+                models_usage=reflection_result.usage,
             ),
             inner_messages=inner_messages,
         )
@@ -348,7 +368,7 @@ class ToolCallAgent(AssistantAgent):
         )
         # only let the orchestrator know the tool call result is successful or not.
         # The actual results will be stored in the memory, and summarized by the summary agent.
-        exec_results = [FunctionExecutionResult(content=result.content if result.is_error else "Success. Continue!", call_id=result.call_id, is_error=result.is_error, name=result.name) for _, result in executed_calls_and_results]
+        exec_results = [FunctionExecutionResult(content=result.content if result.is_error else "Tool call success. Pls continue next step!", call_id=result.call_id, is_error=result.is_error, name=result.name) for _, result in executed_calls_and_results]
         
         # Yield ToolCallExecutionEvent
         tool_call_result_msg = ToolCallExecutionEvent(

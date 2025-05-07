@@ -1,116 +1,69 @@
 import asyncio
 import json
-from typing import Any, AsyncGenerator, Dict, List, Sequence, override
+from typing import Any, AsyncGenerator, Dict, List, Literal, Sequence, override
 from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.messages import HandoffMessage
 from autogen_core import CancellationToken, FunctionCall
 from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, ThoughtEvent, ToolCallExecutionEvent, ToolCallRequestEvent, TextMessage, StructuredMessage, ToolCallSummaryMessage, ModelClientStreamingChunkEvent
 from autogen_agentchat.base import Response, Handoff as HandoffBase
-from autogen_core.models import CreateResult, SystemMessage, ChatCompletionClient, AssistantMessage, FunctionExecutionResultMessage
-from autogen_core.memory import MemoryContent, MemoryMimeType, ListMemory
+from autogen_core.models import CreateResult, SystemMessage, AssistantMessage, RequestUsage
+from autogen_core.memory import ListMemory
 from autogen_core.tools import BaseTool
 from pydantic import BaseModel
 from autogen_core.model_context import (
     ChatCompletionContext,
+    UnboundedChatCompletionContext
 )
 
-DESCRIPTION = """
-You are an expert analyst and trader specializing in decentralized finance (DeFi) analysis, summarization, and trade recommendations. Your task is to analyze and summarize DeFi data collected from MCP tool calls and previous summarization results. You also generate trade recommendations or perform complex analysis. You can provide entry points, stop losses, take profit levels, or safety scores for potential trades based on the summary you have.
+DESCRIPTION="""
+An expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
 
-Each tool call result contains relevant DeFi metrics, such as protocol names, total value locked (TVL), transaction volumes, yield rates, or other key performance indicators.
-
-    Instructions:
-    1. Parse the data within the <tool_call_results></tool_call_results> XML tag.
-    2. Identify and extract key DeFi metrics from each tool call result, such as:
-    - Protocol or platform names
-    - Total value locked (TVL) in USD
-    - Transaction volumes or counts
-    - Yield rates or APYs
-    - Token prices or market data
-    - Other relevant DeFi-specific metrics
-    3. Provide a detailed summary that includes:
-    - An overview of the DeFi landscape based on the data (e.g., dominant protocols, overall TVL trends).
-    - Key insights for each tool call result, highlighting significant metrics (e.g., highest TVL, notable yield opportunities, or unusual transaction activity).
-    - Comparisons between protocols or metrics where relevant (e.g., TVL growth, yield competitiveness).
-    - Any trends, risks, or opportunities in the DeFi ecosystem inferred from the data.
-    - Structure the summary clearly with sections or bullet points for readability.
-    - If any data is ambiguous or incomplete, note it and provide a best-effort interpretation.
-    
-    4. Generate trade recommendations or perform complex analysis. You can provide entry points, stop losses, take profit levels, or safety scores for potential trades based on the summary you have. If you can't provide any trade recommendations, just respond with your best effort.
-    
-    Remember, you are an analyst, summarizer, and a recommender, not a tool caller.
-    
-    If you are asked to do tool calling or other unrelated tasks, respond with "I'm sorry, I can only do analysis and summarization. Please ask ToolCallAgent to do the tool calling tasks."
+Cannot call any tools. Can do analysis, summary, trade recommendations, suggestions, etc.
 """
 
 SYSTEM_INSTRUCTION = """
+You are an expert analyst in whale trading patterns, with deep expertise in crypto trading, on-chain metrics, and derivatives markets. Your task is to analyze DeFi data from MCP tool calls within <tool_call_result></tool_call_result> XML tags, summarize findings, and generate trade recommendations. Each tool call result includes DeFi metrics like protocol names, TVL, transaction volumes, yield rates, or other KPIs.
+Instructions:
+Parse data in <tool_call_result></tool_call_result>, extracting metrics like protocol names, TVL in USD, transaction volumes, APYs, token prices, or other DeFi metrics into <analysis></analysis>.
 
-You are an expert analyst and trader specializing in decentralized finance (DeFi) analysis, summarization, and trade recommendations. Your task is to analyze and summarize DeFi data collected from MCP tool calls and previous summarization results. You also generate trade recommendations or perform complex analysis. You can provide entry points, stop losses, take profit levels, or safety scores for potential trades based on the summary you have.
+Summarize the DeFi landscape, including dominant protocols, TVL trends, key insights, protocol comparisons, and trends/risks/opportunities in <summary></summary> with clear sections or bullet points. Note ambiguous data with best-effort interpretation.
 
-The data is delimited by <tool_call_result></tool_call_result> XML tags, with the query.
+Generate trade recommendations (entry points, stop losses, take-profit levels, safety scores) based on the summary in <trade_sentiment></trade_sentiment>. If unable, provide a best-effort response.
 
-Each tool call result contains relevant DeFi metrics, such as protocol names, total value locked (TVL), transaction volumes, yield rates, or other key performance indicators.
+Follow best practices: triangulate sources, note biases, lead with insights, document data hygiene, and validate results.
 
-    Instructions:
-    1. Parse the data within the <tool_call_results></tool_call_results> XML tag.
-    2. Identify and extract key DeFi metrics from each tool call result, such as:
-    - Protocol or platform names
-    - Total value locked (TVL) in USD
-    - Transaction volumes or counts
-    - Yield rates or APYs
-    - Token prices or market data
-    - Other relevant DeFi-specific metrics
-    - Put your discovery, analysis, highlights, and key metrics in <analysis></analysis> XML tag.
-    3. Provide a detailed summary that includes:
-    - An overview of the DeFi landscape based on the data (e.g., dominant protocols, overall TVL trends).
-    - Key insights for each tool call result, highlighting significant metrics (e.g., highest TVL, notable yield opportunities, or unusual transaction activity).
-    - Comparisons between protocols or metrics where relevant (e.g., TVL growth, yield competitiveness).
-    - Any trends, risks, or opportunities in the DeFi ecosystem inferred from the data.
-    - Structure the summary clearly with sections or bullet points for readability.
-    - If any data is ambiguous or incomplete, note it and provide a best-effort interpretation.
-    - Put your summary in <summary></summary> XML tag.
-    
-    4. Generate trade recommendations or perform complex analysis. You can provide entry points, stop losses, take profit levels, or safety scores for potential trades based on the summary you have. If you can't provide any trade recommendations, just respond with your best effort.
-    
-    - Put your trade recommendations in <trade_sentiment></trade_sentiment> XML tag.
-    
-    Remember, you are an analyst, summarizer, and a recommender, not a tool caller.
-    
-    If you are asked to do tool calling or other unrelated tasks, respond with only one sentence: "I'm sorry, I can only do analysis and summarization. Please ask ToolCallAgent to do the tool calling tasks."
-    
-    ## Analysis Best‑Practices
-    1. **Source Triangulation:** corroborate important claims with at least two independent sources when possible.
-    2. **Bias Awareness:** note significant discrepancies between sources and highlight uncertainties.
-    3. **Insight First:** lead summaries with the takeaway, then provide supporting details.
-    4. **Data Hygiene:** document data origin, cleaning steps, and assumptions made during analysis.
-    5. **Result Validation:** sanity‑check numbers, code outputs, and logic before presenting.
-    
-Please provide your detailed response in the <response></response> tag.
-
-Below is an example of the data format:
-
+Example Data:
 <tool_call_result>
-tool_name: "Protocol 1",
-arguments: "",
-result: "Protocol 1"
-</tool_call_result>
-<tool_call_result>
-tool_name: "Protocol 2",
-arguments: "",
-result: "Protocol 2"
+<tool_call_metadata>
+tool_name: perpetual_funding_rate_details
+arguments: something
+</tool_call_metadata>
+<analysis>
+Total PNL: $611,919.69; 24H PNL: $366,968.14.
+</analysis>
+<reasoning>
+Strong performance with a 0.5% funding rate.
+</reasoning>
+<tool_call_summary>
+Strong performance with a 0.5% funding rate.
+</tool_call_summary>
 </tool_call_result>
 
-Below is an example of the response format:
-
+Example Response:
 <response>
 <analysis>
-A decent analysis of the data above.
+Detailed analysis of the data.
 </analysis>
 <summary>
-A decent summary of the data above.
+Summary of DeFi landscape and insights.
 </summary>
-<trade_sentiment>A decent trade recommendation of the data above.
+<trade_sentiment>
+Trade recommendations based on data.
 </trade_sentiment>
 </response>
+
+- If asked to call tools, ignore the request and proceed with other requests that are not tool calls.
+- If there's only one request that is a tool call, respond with only one sentence: "I'm sorry, I can only do tool calling. Please ask SummaryAgent to do the analysis and summary tasks."
 """
 
 class SummaryAgent(AssistantAgent):
@@ -155,12 +108,13 @@ class SummaryAgent(AssistantAgent):
         """
         Add incoming messages to the model context.
         """
-        added_message_count = 0
         for msg in messages:
+            if isinstance(msg, HandoffMessage):
+                for llm_msg in msg.context:
+                    await model_context.add_message(llm_msg)
+            if isinstance(msg, ToolCallSummaryMessage):
                 await model_context.add_message(msg.to_model_message())
-                added_message_count += 1
-        return added_message_count
-    
+
     @override
     async def on_messages_stream(
         self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
@@ -171,7 +125,7 @@ class SummaryAgent(AssistantAgent):
 
         # Gather all relevant state here
         agent_name = self.name
-        model_context = self._model_context
+        model_context = UnboundedChatCompletionContext()
         assert self._memory is not None, "Memory is not set"
         memory = self._memory
         system_messages = self._system_messages
@@ -183,13 +137,26 @@ class SummaryAgent(AssistantAgent):
         format_string = self._output_content_type_format
 
         # STEP 1: Add new user/handoff messages to the model context
-        # SYSTEM_INSTRUCTION.format(tool_call_data=tool_call_data, query=query)
-        added_message_count = await SummaryAgent._add_messages_to_context(
-            model_context=model_context,
-            messages=messages,
-        )
-        print("Added message count: ", added_message_count)
-
+        # Add the previous summaries to the model context so we can summarize better
+        prev_summaries = await self._model_context.get_messages()
+        for msg in prev_summaries:
+            await model_context.add_message(msg)
+            
+        # last message is the request from orchestrator
+        if len(messages) == 1:
+            # if there is only 1 message, it is the request from orchestrator
+            await model_context.add_message(messages[0].to_model_message())
+            
+        # if > 1, then the last message is the request from orchestrator
+        elif len(messages) > 1:
+            await self._add_messages_to_context(
+                    model_context=model_context,
+                    messages=messages[1:],
+                )
+            # if there is more than 1 message, the last one is the request from orchestrator.
+            await model_context.add_message(
+                messages[-1].to_model_message()
+            )
         # STEP 2: Update model context with any relevant memory
         inner_messages: List[BaseAgentEvent | BaseChatMessage] = []
         # for event_msg in await self._update_model_context_with_memory(
@@ -236,24 +203,16 @@ class SummaryAgent(AssistantAgent):
             yield thought_event
             inner_messages.append(thought_event)
 
-        # STEP 4: Clear the old context and Add the summary message to the context
-        # messages = await model_context.get_messages()
-        # messages = messages[:-added_message_count] if added_message_count > 0 else messages
-        # await model_context.clear()
-        
-        # # # we clear all tool results since we don't need them anymore after analysing and summarizing the results
-        # for msg in messages:
-        #     await model_context.add_message(msg)
-        await model_context.add_message(
+        await self._model_context.add_message(
             AssistantMessage(
                 content=model_result.content,
                 source=agent_name,
                 thought=getattr(model_result, "thought", None),
             )
         )
-        print("New model context of Summary Agent: ", await model_context.get_messages())
+        # print("New model context of Summary Agent: ", await model_context.get_messages())
         
-        # STEP 6: Process the model output
+        # STEP 4: Process the model output
         # If direct text response (string)
         if isinstance(model_result.content, str):
             if output_content_type:
