@@ -1,69 +1,167 @@
-import os
-import json
-from typing import TypedDict, List, Dict, Any
 import asyncio
+from operator import add
+import json
+import traceback
+from typing import Annotated, Literal, Optional, List, Dict, Any, Union
+import asyncio
+import uuid
 from langgraph.graph import StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from langchain_core.prompts import PromptTemplate
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.client import MultiServerMCPClient, SSEConnection
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.types import CallToolResult, TextContent, ImageContent, EmbeddedResource, TextResourceContents, BlobResourceContents
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import StructuredTool, BaseTool
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage
 from langgraph.graph import END, START
-from litellm import acompletion, completion_cost
+from litellm import acompletion, completion_cost,completion
+from langgraph.types import Checkpointer
+from pydantic import BaseModel, ValidationError
 
-# MCP Client Configuration
-MCP_SERVER_URLS = ["http://15.235.225.246:4010/sse"]
-
-# Define the ReWOO state
-class ReWOOState(TypedDict):
-    task: str
-    plan: List[Dict[str, Any]]
-    results: List[Dict[str, Any]]
-    mcp_tools: Dict[str, Any]
+class ModelUsage(BaseModel):
     total_cost: float
     total_tokens: int
     prompt_tokens: int
     completion_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
+    
+# Define the ReWOO states
+class ReWOOState(BaseModel):
+    messages: Annotated[List[AnyMessage], add] # conversation history with reducer to automatically add new messages
+    task: str
+    plan: List[Dict[str, Any]]
+    mcp_results: list[str]
+    analysis: str
+    model_usage: ModelUsage
+    type: Literal["init", "planner", "worker", "solver"]
+    
+class InitState(BaseModel):
+    task: str
+    type: Literal["init"] = "init"
+    
+class PlannerState(BaseModel):
+    task: str
+    plan: List[Dict[str, Any]]
+    model_usage: ModelUsage
+    type: Literal["planner"] = "planner"
 
-# MCP Client: Initialize MultiServerMCPClient
-async def initialize_mcp_client(state: ReWOOState) -> ReWOOState:
+class WorkerState(BaseModel):
+    task: str
+    mcp_results: list[str]
+    model_usage: ModelUsage
+    type: Literal["worker"] = "worker"
+
+class SolverState(BaseModel):
+    task: str
+    analysis: str
+    model_usage: ModelUsage
+    type: Literal["solver"] = "solver"
+
+class ReWOOModel(BaseModel):    
+    model: str
+    api_key: str
+
+class PlannerModel(ReWOOModel):
+    type: Literal["planner"] = "planner"
+
+class AnalysisModel(ReWOOModel):
+    type: Literal["analysis"] = "analysis"
+
+# Function to check if response matches InitState
+def is_init_state(response: Dict) -> InitState | None:
     try:
-        async with MultiServerMCPClient({'hyperwhales': {
-            "url": MCP_SERVER_URLS[0],
-            "transport": "sse",
-        }}) as mcp_client:
-            tools = mcp_client.get_tools()
-            if tools:
-                return {
-                    "mcp_tools": tools,
-                    "total_cost": state.get("total_cost", 0.0),
-                    "total_tokens": state.get("total_tokens", 0),
-                    "prompt_tokens": state.get("prompt_tokens", 0),
-                    "completion_tokens": state.get("completion_tokens", 0),
-                    "cache_read_tokens": state.get("cache_read_tokens", 0),
-                    "cache_write_tokens": state.get("cache_write_tokens", 0)
-                }
-            raise Exception("Failed to retrieve MCP tools")
-    except Exception as e:
-        print(f"Error initializing MCP client: {e}")
-        return {
-            "mcp_tools": {},
-            "total_cost": state.get("total_cost", 0.0),
-            "total_tokens": state.get("total_tokens", 0),
-            "prompt_tokens": state.get("prompt_tokens", 0),
-            "completion_tokens": state.get("completion_tokens", 0),
-            "cache_read_tokens": state.get("cache_read_tokens", 0),
-            "cache_write_tokens": state.get("cache_write_tokens", 0)
-        }
+        return InitState.model_validate(response)
+    except ValidationError:
+        return None
+    
+def is_planner_state(response: Dict) -> PlannerState | None:
+    try:
+        return PlannerState.model_validate(response)
+    except ValidationError:
+        return None
+
+def is_worker_state(response: Dict) -> WorkerState | None:
+    try:
+        return WorkerState.model_validate(response)
+    except ValidationError:
+        return None
+
+def is_solver_state(response: Dict) -> SolverState | None:
+    try:
+        return SolverState.model_validate(response)
+    except ValidationError:
+        return None
+
+StructuredResponse = Union[dict, BaseModel]
+StructuredResponseSchema = Union[dict, type[BaseModel]]
+    
+DEFAULT_PLANNER_USER_PROMPT = """
+You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not. 
+
+When you use any tool, I expect you to push its limits: fetch all the data it can provide, whether that means iterating through multiple batches, adjusting parameters like offsets, or running the tool repeatedly to cover every scenario. Don't work with small set of data for sure, fetch as much as you can. Don’t stop until you’re certain you’ve captured everything there is to know.
+"""
+
+DEFAULT_ANALYSIS_USER_PROMPT = """
+#### 2. DeFi-Specific Analysis Prompt
+This compact prompt guides the LLM to analyze DeFi metrics, aligning with the Markdown structure.
+
+```plaintext
+Analyze DeFi metrics from task results, focusing on:
+- Protocol metrics: TVL (USD), APYs, transaction volumes, user activity.
+- Token metrics: Prices, trading volumes, volatility.
+- Wallet metrics: Balances, transaction patterns.
+- Market data: Liquidity, funding rates, leverage.
+
+For each <result> tag:
+- Extract metrics from "tool_responses" (e.g., TVL, APY, prices).
+- Compare protocols, tokens, or wallets across steps.
+- Identify trends (e.g., TVL growth, yield changes).
+
+Output requirements:
+- **Market Overview**: Summarize protocol TVL, volumes, yields, and token performance (30-day trends).
+- **Top-Performing Entities**: Detail top protocols or wallets (e.g., TVL, APY, PnL) with strategies.
+- **Patterns**: Identify protocol usage or wallet trading patterns (e.g., yield farming, arbitrage).
+- **Risk Assessment**: List risks (e.g., smart contract issues, high leverage) with asset-specific ratings.
+- **Trend Analysis**: Analyze token price or protocol TVL trends with support/resistance levels.
+- **Recommendations**: Suggest DeFi strategies (e.g., staking, liquidity provision) with risk/reward and safety scores.
+- **Conclusion**: Highlight key DeFi trends, risks, and opportunities.
+- Note step relationships (e.g., protocol data informing token prices).
+- Flag incomplete data with assumptions.
+"""
+
+def create_tool_to_url_map(
+    mcp_server_name_to_tools: Dict[str, List[BaseTool]],
+    sse_mcp_server_sessions: Dict[str, SSEConnection]
+) -> Dict[str, str]:
+    """
+    Create a mapping of tool names to their corresponding server URLs.
+    
+    Args:
+        mcp_server_name_to_tools: Dictionary mapping server names to lists of BaseTool objects.
+        sse_mcp_server_sessions: Dictionary mapping server names to SSEConnection dictionaries
+        with a 'url' key.
+    
+    Returns:
+        Dictionary mapping tool names to server URLs.
+    """
+    tool_to_url = {}
+    
+    for server_name, tools in mcp_server_name_to_tools.items():
+        if server_name in sse_mcp_server_sessions:
+            server_url = sse_mcp_server_sessions[server_name].get('url')
+            for tool in tools:
+                # Assuming BaseTool has a 'name' attribute
+                tool_to_url[tool.name] = server_url
+    
+    return tool_to_url
 
 # MCP Client: Execute a tool call via SSE
-async def call_tool(tool_name: str, args: Dict) -> CallToolResult:
+async def call_tool(tool_name: str, args: Dict, sse_server_url: str) -> CallToolResult:
     try:
         tool_result = await asyncio.wait_for(
-            execute_call_tool(tool_name=tool_name, args=args),
+            execute_call_tool(tool_name=tool_name, args=args, sse_server_url=sse_server_url),
             timeout=60
         )
         return tool_result
@@ -74,8 +172,8 @@ async def call_tool(tool_name: str, args: Dict) -> CallToolResult:
             isError=True
         )
 
-async def execute_call_tool(tool_name: str, args: Dict) -> CallToolResult:
-    async with sse_client(MCP_SERVER_URLS[0]) as (read, write):
+async def execute_call_tool(tool_name: str, args: Dict, sse_server_url: str) -> CallToolResult:
+    async with sse_client(sse_server_url) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             try:
@@ -92,343 +190,397 @@ async def execute_call_tool(tool_name: str, args: Dict) -> CallToolResult:
                     isError=True
                 )
 
-# Worker: Execute all tool calls across all plan steps
-async def worker(state: ReWOOState) -> ReWOOState:
-    plan = state["plan"]
-    results: list[str] = []
-    for step in plan:
-        step_results = {
-            "step_description": step["description"],
-            "tool_responses": []
-        }
-        for tool_call in step["tool_calls"]:
-            try:
-                response = await call_tool(tool_call["method"], tool_call.get("params", {}))
-                parsed_response_content: list[str] = []
-                if isinstance(response.content, list):
-                    for item in response.content:
-                        if isinstance(item, TextContent):
-                            parsed_response_content.append({"type": item.type, "text": item.text})
-                        elif isinstance(item, ImageContent):
-                            parsed_response_content.append({"type": item.type, "image": item.data, "mime_type": item.mimeType})
-                        elif isinstance(item, EmbeddedResource):
-                            if isinstance(item.resource, TextResourceContents):
-                                parsed_response_content.append({"type": item.type, "data": item.resource.text, "mime_type": item.resource.mimeType})
-                            elif isinstance(item.resource, BlobResourceContents):
-                                parsed_response_content.append({"type": item.type, "data": item.resource.blob, "mime_type": item.resource.mimeType})
-                            else:
-                                raise ValueError(f"Unsupported resource type: {type(item.resource)}")
-                        else:
-                            raise ValueError(f"Unsupported content type: {type(item)}")
-                result = {
-                    "response": parsed_response_content,
-                    "isError": response.isError
-                } if response else {"error": "No response received"}
-            except Exception as e:
-                print(f"Error executing MCP command {tool_call['method']}: {e}")
-                result = {"error": str(e), "isError": True}
-            step_results["tool_responses"].append({
-                "method": tool_call["method"],
-                "params": tool_call.get("params", {}),
-                **result
-            })
-        results.append(f"\n<result>{json.dumps(step_results)}</result>\n")
-    return {
-        "results": results,
-        "total_cost": state.get("total_cost", 0.0),
-        "total_tokens": state.get("total_tokens", 0),
-        "prompt_tokens": state.get("prompt_tokens", 0),
-        "completion_tokens": state.get("completion_tokens", 0),
-        "cache_read_tokens": state.get("cache_read_tokens", 0),
-        "cache_write_tokens": state.get("cache_write_tokens", 0)
-    }
+class ReWooAgent:    
+    def __init__(
+        self,
+        sse_mcp_server_sessions: dict[str, SSEConnection],
+        planner_model: PlannerModel,
+        analysis_model: AnalysisModel,
+        checkpointer: Optional[Checkpointer] = None,
+        user_prompt: str = DEFAULT_PLANNER_USER_PROMPT,
+        user_analysis_prompt: str = DEFAULT_ANALYSIS_USER_PROMPT,
+        ):
+            self.planner_model = planner_model
+            self.analysis_model = analysis_model
+            self.sse_mcp_server_sessions = sse_mcp_server_sessions
+            self.user_prompt = user_prompt
+            self.user_analysis_prompt = user_analysis_prompt
+            self.tools: list[BaseTool] = []
+            self.mcp_server_name_to_tools: dict[str, list[BaseTool]] = {}
+            self.tool_to_url: dict[str, str] = {}
+            self.checkpointer = checkpointer
+            
+    # Planner: Generate a structured plan using litellm
+    planner_prompt = PromptTemplate(
+        input_variables=["task", "tools", "user_prompt"],
+        template="""
+        {user_prompt}
+            
+        Create a step-by-step plan in JSON format to accomplish the task: {task}
 
-# Planner: Generate a structured plan using litellm
-planner_prompt = PromptTemplate(
-    input_variables=["task", "tools"],
-    template="""
-    
-You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not. 
+        Available MCP tools: {tools}
 
-When you use any tool, I expect you to push its limits: fetch all the data it can provide, whether that means iterating through multiple batches, adjusting parameters like offsets, or running the tool repeatedly to cover every scenario. Don't work with small set of data for sure, fetch as much as you can. Don’t stop until you’re certain you’ve captured everything there is to know.
-    
-Create a step-by-step plan in JSON format to accomplish the task: {task}
+        Each step must be a JSON object with a 'description' (string) and a 'tool_calls' array. The description should be at least 5 to 10 sentences per step. 
+        Each tool call is an object with 'name' (string, matching an MCP tool) and 'args' (object).
 
-Available MCP tools: {tools}
+        Example format:
+        [
+        {{
+            "description": "Step 1",
+            "tool_calls": [
+            {{"name": "list_resources", "args": {{}}}},
+            {{"name": "get_info", "args": {{"id": "123"}}}}
+            ]
+        }},
+        {{
+            "description": "Step 2",
+            "tool_calls": [
+            {{"name": "process_data", "args": {{"data": "value"}}}}
+            ]
+        }}
+        ]
 
-Each step must be a JSON object with a 'description' (string) and a 'tool_calls' array. The description should be at least 5 to 10 sentences per step. 
-Each tool call is an object with 'method' (string, matching an MCP tool) and 'params' (object).
+        Return only the JSON array, nothing else."""
+    )
+                
+    # Analysis and Summary Prompts
+    analysis_prompt = PromptTemplate(
+        input_variables=["task", "user_analysis_prompt"],
+        template="""
+        
+        # Detailed Analysis
 
-Example format:
-[
-  {{
-    "description": "Step 1",
-    "tool_calls": [
-      {{"method": "list_resources", "params": {{}}}},
-      {{"method": "get_info", "params": {{"id": "123"}}}}
-    ]
-  }},
-  {{
-    "description": "Step 2",
-    "tool_calls": [
-      {{"method": "process_data", "params": {{"data": "value"}}}}
-    ]
-  }}
-]
+        You are an expert AI assistant tasked with analyzing the results of the task '{task}' provided in <result></result> XML tags. Multiple tags indicate multiple tool calls. The user has provided domain-specific analysis instructions in '{user_analysis_prompt}'.
 
-Return only the JSON array, nothing else."""
-)
+        ## Instructions
+        - Parse JSON data in each <result></result> tag, containing "step_description" and "tool_responses" (with "name", "args", "isError", "response").
+        - Structure the output in Markdown following the format below, ensuring clarity and depth:
+        - **Market Overview**: Summarize current market conditions and key asset performance (if applicable).
+        - **Top-Performing Entities**: Analyze key entities (e.g., whales, protocols) with metrics and strategies.
+        - **Identified Patterns**: Identify behavioral or operational patterns (e.g., trading strategies).
+        - **Risk Assessment**: Evaluate risks with a table or list of risk factors.
+        - **Market Trend Analysis**: Analyze trends for key assets or metrics.
+        - **Recommendations**: Provide actionable recommendations with rationale, risk/reward, and safety scores.
+        - **Conclusion**: Summarize findings, trends, and strategic advice.
+        - Explicitly note relationships between steps in the relevant section (e.g., Market Overview or Top-Performing Entities).
+        - Flag ambiguous or incomplete data with best-effort interpretation.
+        - Ensure the analysis is successful (complete and aligned with instructions) or note failures.
 
-async def planner(state: ReWOOState) -> ReWOOState:
-    tools: list[StructuredTool] = state.get("mcp_tools", {})
-    prompt = planner_prompt.format(task=state["task"], tools=json.dumps([tool.name for tool in tools]))
-   
-    # Format tools for Anthropic
-    formatted_tools = []
-    for tool in tools:
+        ## Output Format
+        ```markdown
+        # Detailed Analysis
+
+        ## 1. Market Overview
+        ### Current Market Conditions
+        [Summary of market metrics, e.g., TVL, volumes, or positions]
+        ### Key Asset Performance
+        [Asset-specific metrics, trends, and analysis]
+
+        ## 2. Top-Performing Entities
+        [Details of key entities, e.g., protocols or whales, with metrics and strategies]
+
+        ## 3. Identified Patterns
+        [Behavioral or operational patterns, e.g., trading or protocol strategies]
+
+        ## 4. Risk Assessment
+        [Risk factors with table or list, including asset-specific risks]
+
+        ## 5. Market Trend Analysis
+        [Trend analysis for key assets or metrics, e.g., price, TVL]
+
+        ## 6. Recommendations
+        [Actionable recommendations with entry, stop loss, take profit, leverage, risk/reward, safety score, timeframe, and rationale]
+
+        ## 7. Conclusion
+        [Summary of findings, trends, and strategic advice]
+
+        ## Success
+        [true/false with brief explanation]
+        ```
+        """
+    )
+                
+    # MCP Client: Initialize MultiServerMCPClient
+    async def initialize_mcp_client(self):
         try:
-            # Ensure schema is compatible with Anthropic
-            schema = tool.args_schema or {"type": "object", "properties": {}, "required": []}
-            if isinstance(schema, dict) and "type" not in schema:
-                schema["type"] = "object"
-            formatted_tools.append({
-                "name": tool.name,
-                "description": tool.description or f"Tool: {tool.name}",
-                "input_schema": schema
-            })
+            async with MultiServerMCPClient(self.sse_mcp_server_sessions) as mcp_client:
+                tools = mcp_client.get_tools()
+                self.tools = tools
+                self.mcp_server_name_to_tools = mcp_client.server_name_to_tools
+                self.tool_to_url = create_tool_to_url_map(
+                    self.mcp_server_name_to_tools, 
+                    self.sse_mcp_server_sessions
+                )
+                if not tools:
+                    raise Exception("Failed to retrieve MCP tools")
         except Exception as e:
-            print(f"Error formatting tool {tool.name}: {e}")
-            continue
-    
-    # Use litellm for completion
-    response = await acompletion(
-        model=os.getenv("LLM_MODEL"),
-        messages=[{"role": "user", "content": prompt}],
-        api_key=os.getenv("API_KEY"),
-        tools=formatted_tools
-    )
-    
-    # Calculate cost and tokens
-    cost = completion_cost(response)
-    token_data = response.usage if response.usage else {}
-    total_cost = state.get("total_cost", 0.0) + cost
-    total_tokens = state.get("total_tokens", 0) + token_data.get('total_tokens', 0)
-    prompt_tokens = state.get("prompt_tokens", 0) + token_data.get('prompt_tokens', 0)
-    completion_tokens = state.get("completion_tokens", 0) + token_data.get('completion_tokens', 0)
-    cache_read_tokens = state.get("cache_read_tokens", 0) + token_data.get('cache_read_tokens', 0)
-    cache_write_tokens = state.get("cache_write_tokens", 0) + token_data.get('cache_write_tokens', 0)
-    
-    try:
-        plan = json.loads(response.choices[0].message.content)
-        if not isinstance(plan, list):
-            raise ValueError("Plan must be a JSON array")
-        for step in plan:
-            if not isinstance(step, dict) or "description" not in step or "tool_calls" not in step:
-                raise ValueError("Each step must have 'description' and 'tool_calls'")
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"Error parsing plan: {e}")
-        plan = [{
-            "description": "Fallback: Query MCP server",
-            "tool_calls": [{"method": "list_resources", "params": {}}]
-        }]
-    return {
-        "plan": plan,
-        "results": [],
-        "total_cost": total_cost,
-        "total_tokens": total_tokens,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "cache_read_tokens": cache_read_tokens,
-        "cache_write_tokens": cache_write_tokens
-    }
+            print(f"Error initializing MCP client: {e}")
+            raise e
 
-# Analysis and Summary Prompts
-analysis_prompt = PromptTemplate(
-    input_variables=["task"],
-    template="""
+    # Worker: Execute all tool calls across all plan steps
+    async def worker(self, state: PlannerState) -> WorkerState:
+        results: list[str] = []
+        for step in state.plan:
+            step_results = {
+                "step_description": step["description"],
+                "tool_responses": []
+            }
+            for tool_call in step["tool_calls"]:
+                try:
+                    server_url = self.tool_to_url[tool_call["name"]]
+                    response = await call_tool(
+                        tool_call["name"], 
+                        tool_call.get("args", {}), 
+                        server_url
+                    )
+                    parsed_response_content: list[str] = []
+                    if isinstance(response.content, list):
+                        for item in response.content:
+                            if isinstance(item, TextContent):
+                                parsed_response_content.append({
+                                    "type": item.type, 
+                                    "text": item.text
+                                })
+                            elif isinstance(item, ImageContent):
+                                parsed_response_content.append({
+                                    "type": item.type, 
+                                    "image": item.data, 
+                                    "mime_type": item.mimeType
+                                })
+                            elif isinstance(item, EmbeddedResource):
+                                if isinstance(item.resource, TextResourceContents):
+                                    parsed_response_content.append({
+                                        "type": item.type, 
+                                        "data": item.resource.text, 
+                                        "mime_type": item.resource.mimeType
+                                    })
+                                elif isinstance(item.resource, BlobResourceContents):
+                                    parsed_response_content.append({
+                                        "type": item.type, 
+                                        "data": item.resource.blob, 
+                                        "mime_type": item.resource.mimeType
+                                    })
+                                else:
+                                    raise ValueError(
+                                        f"Unsupported resource type: {type(item.resource)}"
+                                    )
+                            else:
+                                raise ValueError(f"Unsupported content type: {type(item)}")
+                    result = {
+                        "response": parsed_response_content,
+                        "isError": response.isError
+                    } if response else {"error": "No response received"}
+                except Exception as e:
+                    print(f"Error executing MCP command {tool_call['name']}: {e}")
+                    result = {"error": str(e), "isError": True}
+                step_results["tool_responses"].append({
+                    "name": tool_call["name"],
+                    "args": tool_call.get("args", {}),
+                    **result
+                })
+            results.append(f"\n<result>{json.dumps(step_results)}</result>\n")
+        return {
+            "mcp_results": results,
+            "type": "worker"
+        }
+
+    async def planner(self, state: InitState) -> PlannerState:
+        prompt = self.planner_prompt.format(
+            task=state.task, 
+            tools=json.dumps([tool.name for tool in self.tools]), 
+            user_prompt=self.user_prompt
+        )
     
-    You are an expert AI assistant specializing in DeFi analysis, tasked with analyze the results of all steps for the DeFi tasks '{task}' and the results in <result></result> XML tags. Multiple tags indicate multiple tool calls, each to be processed separately, containing DeFi metrics like protocol names, TVL, transaction volumes, yield rates, or other KPIs.
-    Instructions:
-    Parse data in <result></result>.
-
-    Analyze DeFi metrics (e.g., token prices, wallet balances, TVL in USD, transaction volumes, APYs, market data) in <analysis></analysis> tag, covering all tokens, wallets, orders, protocols, and relevant metrics.
-
-    Provide reasoning for the analysis in <reasoning></reasoning>, justifying highlights based on <analysis></analysis>.
-
-    Give insights about market trends, key insights, protocol comparisons, and DeFi trends/risks/opportunities in <insights></insights> with clear sections or bullet points.
-
-    Note ambiguous or incomplete data with best-effort interpretation.
-    
-    Lastly, confirm if each analysis is successful or not using <success></success> tag. Inside the tag, you should provide true if the analysis is successful, false otherwise.
-    
-    If you find the relationships of data between the steps, explicitly mention it in details in <analysis></analysis> tag.
-    
-    Your result should be put in <analysis_result></analysis_result> tag.
-
-    Example of the results:
-    Eg:
-    <result>
-        {{
-            "step_description": "Step 1",
-            "tool_responses": [
-                {{"method": "list_resources", "params": {{}}, "isError": false, "response": "Successfully retrieved resources from the MCP server."}}
+        # Format tools for Anthropic
+        formatted_tools = []
+        for tool in self.tools:
+            try:
+                # Ensure schema is compatible with Anthropic
+                schema = tool.args_schema or {
+                    "type": "object", 
+                    "properties": {}, 
+                    "required": []
+                }
+                if isinstance(schema, dict) and "type" not in schema:
+                    schema["type"] = "object"
+                formatted_tools.append({
+                    "name": tool.name,
+                    "description": tool.description or f"Tool: {tool.name}",
+                    "input_schema": schema
+                })
+            except Exception as e:
+                print(f"Error formatting tool {tool.name}: {e}")
+                continue
+        
+        # Use litellm for completion
+        response = await acompletion(
+            model=self.planner_model.model,
+            messages=[{"role": "user", "content": prompt}],
+            api_key=self.planner_model.api_key,
+            tools=formatted_tools
+        )
+        
+        # Calculate cost and tokens
+        cost = completion_cost(response)
+        token_data = response.usage if response.usage else {}
+        total_tokens = token_data.get('total_tokens', 0)
+        prompt_tokens = token_data.get('prompt_tokens', 0)
+        completion_tokens = token_data.get('completion_tokens', 0)
+        cache_read_tokens = token_data.get('cache_read_tokens', 0)
+        cache_write_tokens = token_data.get('cache_write_tokens', 0)
+        
+        try:
+            plan = json.loads(response.choices[0].message.content)
+            if not isinstance(plan, list):
+                raise ValueError("Plan must be a JSON array")
+                
+            ai_messages = [
+                AIMessage(
+                    content=step["description"],
+                    tool_calls=[
+                        {**tool_call, "id": str(uuid.uuid4())}
+                        for tool_call in step["tool_calls"]
+                    ]
+                )
+                for step in plan
             ]
-        }}
-    </result>
-    <result>
-        {{
-            "step_description": "Step 2",
-            "tool_responses": [
-                {{"method": "process_data", "params": {{"data": "value"}}, "isError": false, "response": "Successfully processed data."}}
-            ]
-        }}
-    </result>
+            return {
+                "plan": plan,
+                "messages": [
+                    HumanMessage(content=state.task),
+                    *ai_messages
+                ],
+                "model_usage": {
+                    "total_cost": cost,
+                    "total_tokens": total_tokens,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens
+                },
+                "type": "planner"
+            }
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error parsing plan: {e}")
+            plan = [{
+                "description": "Fallback: Query MCP server",
+                "tool_calls": [{"name": "list_resources", "args": {}, "id": str(uuid.uuid4())}]
+            }]
+        return {
+            "plan": [],
+            "messages": [
+                HumanMessage(content=state.task),
+            ],
+        }
+        
+    # Solver: Analyze and summarize all worker results using litellm
+    async def solver(self, state: WorkerState) -> SolverState:
+        try:
+            # Generate analysis
+            analysis_input = self.analysis_prompt.format(
+                task=state.task,
+                user_analysis_prompt=self.user_analysis_prompt
+            )
+            messages = [{"role": "user", "content": analysis_input}]
+            messages.extend([{"role": "user", "content": result} for result in state.mcp_results])
+            
+            analysis_response = await acompletion(
+                model=self.analysis_model.model,
+                messages=messages,
+                api_key=self.analysis_model.api_key
+            )
+            analysis_cost = completion_cost(analysis_response)
+            analysis_token_data = analysis_response.usage if analysis_response.usage else {}
+            
+            # Update metrics
+            total_cost = state.model_usage.total_cost + analysis_cost
+            total_tokens = (
+                state.model_usage.total_tokens +
+                analysis_token_data.get('total_tokens', 0)
+            )
+            prompt_tokens = (
+                state.model_usage.prompt_tokens +
+                analysis_token_data.get('prompt_tokens', 0)
+            )
+            completion_tokens = (
+                state.model_usage.completion_tokens +
+                analysis_token_data.get('completion_tokens', 0)
+            )
+            cache_read_tokens = (
+                state.model_usage.cache_read_tokens +
+                analysis_token_data.get('cache_read_tokens', 0)
+            )
+            cache_write_tokens = (
+                state.model_usage.cache_write_tokens +
+                analysis_token_data.get('cache_write_tokens', 0)
+            )
+            
+            return {
+                "analysis": analysis_response.choices[0].message.content,
+                "messages": [AIMessage(content=analysis_response.choices[0].message.content)],
+                "model_usage": {
+                    "total_cost": total_cost,
+                    "total_tokens": total_tokens,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens
+                },
+                "type": "solver"
+            }
+        except Exception as e:
+            print(f"Error in solver: {e}")
+            print(traceback.format_exc())
+            return {
+                "task": state.task,
+                "analysis": "",
+                "model_usage": state.model_usage,
+                "type": "solver"
+            }
+        
+async def create_rewoo_agent(
+    sse_mcp_server_sessions: dict[str, SSEConnection],
+    planner_model: PlannerModel,
+    analysis_model: AnalysisModel,
+    checkpointer: Optional[Checkpointer] = None,
+    user_prompt: Optional[str] = None,
+    user_analysis_prompt: Optional[str] = None,
+) -> CompiledStateGraph:
+    """Create a ReWOO agent workflow graph.
     
-    Example of the analysis:
-    <analysis_result>
-    <analysis>
-    your analysis result
-    </analysis>
-    <success>
-    true
-    </success>
-    <reasoning>
-    your reasoning
-    </reasoning>
-    <insights>
-    your insights
-    </insights>
-    </analysis_result>
+    Args:
+        sse_mcp_server_sessions: Dictionary mapping server names to SSE connections
+        planner_model: Model for planning steps
+        analysis_model: Model for analyzing results
+        solver_model: Model for solving/finalizing results
+        checkpointer: Optional checkpointer for state persistence
+        user_prompt: Optional custom user prompt
+        user_analysis_prompt: Optional custom analysis prompt
+        
+    Returns:
+        Compiled workflow graph
     """
-)
-
-summary_prompt = PromptTemplate(
-    input_variables=["task", "analysis"],
-    template="""Summarize the results of all steps for the task '{task}':
-             Analysis: {analysis}
-             Provide a concise summary in JSON format with a single 'summary' field (string). The summary should be within 5-10 sentences, 2-3 paragraphs.
-             
-             The raw results will also be provided in the <result></result> tags. If you find the relationships of data between the steps and in the analysis, which is put in the <analysis_result></analysis_result> tag, explicitly mention it in details with focus on figures, numbers, etc.
-            """
-)
-
-# Solver: Analyze and summarize all worker results using litellm
-async def solver(state: ReWOOState) -> ReWOOState:
-    results: list[str] = state["results"]
-    
-    # Generate analysis
-    analysis_input = analysis_prompt.format(task=state["task"])
-    messages = [{"role": "user", "content": analysis_input}]
-    messages.extend([{"role": "user", "content": result} for result in results])
-    analysis_response = await acompletion(
-        model=os.getenv("LLM_MODEL"),
-        messages=messages,
-        api_key=os.getenv("API_KEY")
+    agent = ReWooAgent(
+        sse_mcp_server_sessions=sse_mcp_server_sessions,
+        planner_model=planner_model,
+        analysis_model=analysis_model,
+        checkpointer=checkpointer,
+        user_prompt=user_prompt,
+        user_analysis_prompt=user_analysis_prompt,
     )
-    analysis_cost = completion_cost(analysis_response)
-    analysis_token_data = analysis_response.usage if analysis_response.usage else {}
+    await agent.initialize_mcp_client()
     
-    # Generate summary
-    summary_input = summary_prompt.format(task=state["task"], analysis=analysis_response.choices[0].message.content)
-    summary_messages = [{"role": "user", "content": summary_input}]
-    summary_messages.extend([{"role": "user", "content": result} for result in results])
-    summary_response = await acompletion(
-        model=os.getenv("LLM_MODEL"),
-        messages=summary_messages,
-        api_key=os.getenv("API_KEY")
-    )
-    summary_cost = completion_cost(summary_response)
-    summary_token_data = summary_response.usage if summary_response.usage else {}
+    workflow = StateGraph(ReWOOState, input=InitState, output=SolverState)
     
-    # Update metrics
-    total_cost = state.get("total_cost", 0.0) + analysis_cost + summary_cost
-    total_tokens = state.get("total_tokens", 0) + analysis_token_data.get('total_tokens', 0) + summary_token_data.get('total_tokens', 0)
-    prompt_tokens = state.get("prompt_tokens", 0) + analysis_token_data.get('prompt_tokens', 0) + summary_token_data.get('prompt_tokens', 0)
-    completion_tokens = state.get("completion_tokens", 0) + analysis_token_data.get('completion_tokens', 0) + summary_token_data.get('completion_tokens', 0)
-    cache_read_tokens = state.get("cache_read_tokens", 0) + analysis_token_data.get('cache_read_tokens', 0) + summary_token_data.get('cache_read_tokens', 0)
-    cache_write_tokens = state.get("cache_write_tokens", 0) + analysis_token_data.get('cache_write_tokens', 0) + summary_token_data.get('cache_write_tokens', 0)
-    
-    # Append analysis and summary to results
-    final_results = results + [{"analysis": analysis_response.choices[0].message.content, "summary": summary_response.choices[0].message.content}]
-    return {
-        "results": final_results,
-        "total_cost": total_cost,
-        "total_tokens": total_tokens,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "cache_read_tokens": cache_read_tokens,
-        "cache_write_tokens": cache_write_tokens
-    }
+    # Add nodes
+    workflow.add_node("planner", agent.planner)
+    workflow.add_node("worker", agent.worker)
+    workflow.add_node("solver", agent.solver)
 
-# Define the LangGraph workflow
-workflow = StateGraph(ReWOOState)
-workflow.add_node("initialize_mcp", initialize_mcp_client)
-workflow.add_node("planner", planner)
-workflow.add_node("worker", worker)
-workflow.add_node("solver", solver)
-workflow.add_edge("initialize_mcp", "planner")
-workflow.add_edge("planner", "worker")
-workflow.add_edge("worker", "solver")
-workflow.add_edge("solver", END)
-workflow.add_edge(START, "initialize_mcp")
-graph = workflow.compile()
+    # Add edges
+    workflow.add_edge(START, "planner")
+    workflow.add_edge("planner", "worker")
+    workflow.add_edge("worker", "solver")
+    workflow.add_edge("solver", END)
 
-# Main function to run the agent
-async def run_rewoo_agent(task: str):
-    initial_state = ReWOOState(
-        task=task,
-        plan=[],
-        results=[],
-        mcp_tools={},
-        total_cost=0.0,
-        total_tokens=0,
-        prompt_tokens=0,
-        completion_tokens=0,
-        cache_read_tokens=0,
-        cache_write_tokens=0
-    )
-    final_state = None
-    print("Starting streaming workflow...")
-    async for chunk in graph.astream(initial_state):
-        print("\n--- Stream Chunk ---")
-        print(chunk)
-        final_state = chunk if chunk else final_state
-    
-    print("\n--- Streaming Complete ---")
-    if final_state:
-        print(f"Total Completion Cost: ${final_state.get('total_cost', 0.0):.6f}")
-        print(f"Total Tokens: {final_state.get('total_tokens', 0)}")
-        print(f"Prompt Tokens: {final_state.get('prompt_tokens', 0)}")
-        print(f"Completion Tokens: {final_state.get('completion_tokens', 0)}")
-        print(f"Cache Read Tokens: {final_state.get('cache_read_tokens', 0)}")
-        print(f"Cache Write Tokens: {final_state.get('cache_write_tokens', 0)}")
-    return final_state
-
-# Example usage
-if __name__ == "__main__":
-    task = """
-    You are a Perpetual Whales Agent agent who is an expert analyst specializing in detecting whale trading patterns with years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies.
-
-    You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
-
-    Here will be your task, please do it from step by step, one task is done you will able to move to next task. DO NOT use liquidity heatmap tool, function for analyzing:
-
-    - Fetching every whales on some markets
-    - Find trading patterns and strategies identified based on latest whales activity, histocial trading pnl
-    - Risk assessment of all current positions
-    - Analyze market trend based on 30 days of tokens
-    - Define short-term trades as many as possible that can be executed with safety scoring and entries, stop loss, take profit, concise description, bias including short-term or long-term trades. The entries should be closest to latest price, stop loss and take profit should be realistic which is not too far from entry.
-    
-    Identify and extract key DeFi metrics from each tool call result, such as:
-    - Protocol or platform names
-    - Total value locked (TVL) in USD
-    - Transaction volumes or counts
-    - Yield rates or APYs
-    - Token prices or market data
-    - Other relevant DeFi-specific metrics
-
-    Summarize your final report as detailed as possible. Make it from 5 to 10 paragraphs. Remember to be very specific and precise about the metrics and numbers.
-    """
-    final_state = asyncio.run(run_rewoo_agent(task))
-    print("Final State:")
-    print(json.dumps(final_state, indent=2, default=lambda o: '<not serializable>'))
+    return workflow.compile()

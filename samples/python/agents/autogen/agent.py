@@ -130,6 +130,7 @@ class Agent:
             self.tools.extend(server_tools)
         asyncio.create_task(self.cleanup_sessions())
         logger.info(f"{self.LABEL} initialized and cleanup_sessions task scheduled")
+        
     async def initialize_with_mcp_sse_urls(self, sse_mcp_server_urls: list[str]):
         api_key = os.getenv("API_KEY")
         model = os.getenv("LLM_MODEL")
