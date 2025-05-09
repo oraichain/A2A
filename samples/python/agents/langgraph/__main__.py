@@ -22,22 +22,25 @@ def main(host, port):
     url = os.getenv('DOMAIN_URL', f'http://{host}:{port}/')
     print(f"URL: {url}")
     try:
-        if not os.getenv("API_KEY"):
+        if not os.getenv("PLANNER_API_KEY") or not os.getenv("ANALYSIS_API_KEY"):
             raise MissingAPIKeyError("API_KEY environment variable not set.")
-        if not os.getenv("LLM_MODEL"):
+        if not os.getenv("PLANNER_LLM_MODEL") or not os.getenv("ANALYSIS_LLM_MODEL"):
             raise MissingAPIKeyError("LLM_MODEL environment variable not set.")
 
+        description = """
+        A skillful DeFi Analysis Agent. Analyze whale trading patterns, positions, and portfolio changes over time. Provide insights and trade suggestions. I don't store or remember any previous crawled or analyzed data. However, if you provide your knowledge or data, put them in the <knowledge_gathered></knowledge_gathered> tag. I will use it along with the latest data fetched from the tools I have to provide you with the best possible analysis.
+        """
         capabilities = AgentCapabilities(streaming=True)
         skill = AgentSkill(
             id="hyperwhales",
             name="Hyperwhales",
-            description="Analyze whale trading patterns, positions, and portfolio changes over time. Provide insights and trade suggestions.",
+            description=description,
             tags=["hyperwhales"],
             examples=["Find me some trades now based on whales data and history"],
         )
         agent_card = AgentCard(
             name="Hyperwhales",
-            description="Analyze whale trading patterns, positions, and portfolio changes over time. Provide insights and trade suggestions.",
+            description=description,
             url=url,
             version="1.0.0",
             defaultInputModes=["text", "text/plain"],

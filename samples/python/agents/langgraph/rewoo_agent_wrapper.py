@@ -6,7 +6,7 @@ import traceback
 from common.types import FilePart, TextPart
 from langgraph.checkpoint.memory import MemorySaver
 from typing import Any, Dict, AsyncIterable, List, Tuple
-from rewoo import InitState, PlannerModel, AnalysisModel, PlannerState, SolverState, WorkerState, create_rewoo_agent, is_init_state, is_planner_state, is_worker_state, is_solver_state
+from rewoo import InitState, ModelUsage, PlannerModel, AnalysisModel, PlannerState, SolverState, WorkerState, create_rewoo_agent, is_init_state, is_planner_state, is_worker_state, is_solver_state
 from langchain_mcp_adapters.client import SSEConnection
 
 memory = MemorySaver()
@@ -15,11 +15,14 @@ logger = logging.getLogger(__name__)
 class ReWOOAgentWrapper:
 
     def __init__(self, sse_mcp_server_sessions: dict[str, SSEConnection]):
-        self.model_name = os.getenv("LLM_MODEL")
-        self.api_key = os.getenv("API_KEY")
-        self.planner_model = PlannerModel(model=self.model_name, api_key=self.api_key)
-        self.analysis_model = AnalysisModel(model=self.model_name, api_key=self.api_key)
+        self.planner_model_name = os.getenv("PLANNER_LLM_MODEL")
+        self.planner_api_key = os.getenv("PLANNER_API_KEY")
+        self.planner_model = PlannerModel(model=self.planner_model_name, api_key=self.planner_api_key)
+        self.analysis_model_name = os.getenv("ANALYSIS_LLM_MODEL")
+        self.analysis_api_key = os.getenv("ANALYSIS_API_KEY")
+        self.analysis_model = AnalysisModel(model=self.analysis_model_name, api_key=self.analysis_api_key)
         self.sse_mcp_server_sessions = sse_mcp_server_sessions
+        self.session_lock = asyncio.Lock()
         
     async def initialize(self):
         self.graph = await create_rewoo_agent(
@@ -31,6 +34,7 @@ class ReWOOAgentWrapper:
     async def stream(self, query: str, session_id: str, task_id: str) -> AsyncIterable[Dict[str, Any]]:
         inputs = InitState(task=query)
         config = {"configurable": {"thread_id": f"{session_id}_{task_id}"}}
+        logger.info(f"Stream for session {session_id} with task {task_id} started with query: {query}")
 
         try:
             async for event in self.graph.astream(inputs, config, stream_mode="values"):
@@ -52,7 +56,7 @@ class ReWOOAgentWrapper:
             }
         finally:
             logger.info(f"Stream for session {session_id} and task {task_id} completed")
-        
+
     async def process_event(self, event, session_id: str, task_id: str) -> Dict[str, Any]:
         try:
             state = is_init_state(event)
@@ -68,13 +72,10 @@ class ReWOOAgentWrapper:
             state = is_planner_state(event) or is_worker_state(event)
             if state:
                 content, images = self.extract_message_content(state)
-                model_usage = state.model_usage
-                logger.info(f"Model usage: {model_usage}")
-                logger.info(f"Content of planner/worker: {content}")
                 return {
                     "is_task_complete": False,
                     "require_user_input": False,
-                    "model_usage": model_usage,
+                    "model_usage": None,
                     "content": content,
                     "images": images,
                 }
@@ -82,13 +83,10 @@ class ReWOOAgentWrapper:
             state = is_solver_state(event)
             if state:
                 content, images = self.extract_message_content(state)
-                model_usage = state.model_usage
-                logger.info(f"Model usage: {model_usage}")
-                logger.info(f"Content of solver: {content}")
                 return {
                     "is_task_complete": True,
                     "require_user_input": False,
-                    "model_usage": model_usage,
+                    "model_usage": state.model_usage,
                     "content": content,
                     "images": images,
                 }

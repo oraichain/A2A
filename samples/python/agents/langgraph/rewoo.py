@@ -101,9 +101,7 @@ StructuredResponse = Union[dict, BaseModel]
 StructuredResponseSchema = Union[dict, type[BaseModel]]
     
 DEFAULT_PLANNER_USER_PROMPT = """
-You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not. 
-
-When you use any tool, I expect you to push its limits: fetch all the data it can provide, whether that means iterating through multiple batches, adjusting parameters like offsets, or running the tool repeatedly to cover every scenario. Don't work with small set of data for sure, fetch as much as you can. Don’t stop until you’re certain you’ve captured everything there is to know.
+You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
 """
 
 DEFAULT_ANALYSIS_USER_PROMPT = """
@@ -111,7 +109,7 @@ DEFAULT_ANALYSIS_USER_PROMPT = """
 This compact prompt guides the LLM to analyze DeFi metrics, aligning with the Markdown structure.
 
 ```plaintext
-Analyze DeFi metrics from task results, focusing on:
+Analyze DeFi metrics from task results, focusing on, but not limited to:
 - Protocol metrics: TVL (USD), APYs, transaction volumes, user activity.
 - Token metrics: Prices, trading volumes, volatility.
 - Wallet metrics: Balances, transaction patterns.
@@ -120,18 +118,7 @@ Analyze DeFi metrics from task results, focusing on:
 For each <result> tag:
 - Extract metrics from "tool_responses" (e.g., TVL, APY, prices).
 - Compare protocols, tokens, or wallets across steps.
-- Identify trends (e.g., TVL growth, yield changes).
-
-Output requirements:
-- **Market Overview**: Summarize protocol TVL, volumes, yields, and token performance (30-day trends).
-- **Top-Performing Entities**: Detail top protocols or wallets (e.g., TVL, APY, PnL) with strategies.
-- **Patterns**: Identify protocol usage or wallet trading patterns (e.g., yield farming, arbitrage).
-- **Risk Assessment**: List risks (e.g., smart contract issues, high leverage) with asset-specific ratings.
-- **Trend Analysis**: Analyze token price or protocol TVL trends with support/resistance levels.
-- **Recommendations**: Suggest DeFi strategies (e.g., staking, liquidity provision) with risk/reward and safety scores.
-- **Conclusion**: Highlight key DeFi trends, risks, and opportunities.
-- Note step relationships (e.g., protocol data informing token prices).
-- Flag incomplete data with assumptions.
+- Identify trends, patterns, relationships, implications, and recommendations (e.g., TVL growth, yield changes).
 """
 
 def create_tool_to_url_map(
@@ -222,9 +209,11 @@ class ReWooAgent:
         Create a step-by-step plan in JSON format to accomplish the task: {task}
 
         Available MCP tools: {tools}
+        
+        Extract the already gathered information from the user, which is provided in <knowledge_gathered></knowledge_gathered> XML tag, and use it to inform the plan and call tools appropriately. Refrain from calling tools if you already have the information in the <knowledge_gathered></knowledge_gathered> XML tag. If there is no <knowledge_gathered></knowledge_gathered> XML tag, you can safely ignore it.
 
-        Each step must be a JSON object with a 'description' (string) and a 'tool_calls' array. The description should be at least 5 to 10 sentences per step. 
-        Each tool call is an object with 'name' (string, matching an MCP tool) and 'args' (object).
+        Each step must be a JSON object with a 'description' (string) and a 'tool_calls' array. The description should be at within 2-3 sentences per step. 
+        Each tool call is an object with 'name' (string, matching an MCP tool) and 'args' (object). Also, keep the tool calls minimal and only use as many as needed to fully satisfy the task's requirements efficiently.
 
         Example format:
         [
@@ -253,52 +242,20 @@ class ReWooAgent:
         
         # Detailed Analysis
 
-        You are an expert AI assistant tasked with analyzing the results of the task '{task}' provided in <result></result> XML tags. Multiple tags indicate multiple tool calls. The user has provided domain-specific analysis instructions in '{user_analysis_prompt}'.
+        You are an expert AI assistant tasked with analyzing the results of the task '{task}' provided in <result></result> XML tags. Multiple tags indicate multiple tool calls. Your goal is to deliver a concise, precise response that fully satisfies the main agent's request while minimizing token usage and providing deep analysis of key metrics, relationships, and their implications.
 
-        ## Instructions
-        - Parse JSON data in each <result></result> tag, containing "step_description" and "tool_responses" (with "name", "args", "isError", "response").
-        - Structure the output in Markdown following the format below, ensuring clarity and depth:
-        - **Market Overview**: Summarize current market conditions and key asset performance (if applicable).
-        - **Top-Performing Entities**: Analyze key entities (e.g., whales, protocols) with metrics and strategies.
-        - **Identified Patterns**: Identify behavioral or operational patterns (e.g., trading strategies).
-        - **Risk Assessment**: Evaluate risks with a table or list of risk factors.
-        - **Market Trend Analysis**: Analyze trends for key assets or metrics.
-        - **Recommendations**: Provide actionable recommendations with rationale, risk/reward, and safety scores.
-        - **Conclusion**: Summarize findings, trends, and strategic advice.
-        - Explicitly note relationships between steps in the relevant section (e.g., Market Overview or Top-Performing Entities).
-        - Flag ambiguous or incomplete data with best-effort interpretation.
-        - Ensure the analysis is successful (complete and aligned with instructions) or note failures.
+        1. Parse JSON data in each <result></result> tag, containing "step_description" and "tool_responses" (with "name", "args", "isError", "response").
+        2. Extract the already gathered information from the user, which is provided in <knowledge_gathered></knowledge_gathered> XML tag, and use it for analysis, key metrics, finding relationships between knowledge gathered and tool responses.
+        3. Synthesize results to directly address the task's requirements, focusing on essential details and avoiding redundancy.
+        4. Identify and highlight key metrics, patterns, and relationships across tool responses. Explain their implications for the task's objectives in a clear, actionable manner.
+        5. Structure the response to match the task's requested format (e.g., lists, tables, or summaries) to ensure clarity and completeness.
+        6. If the task requires recommendations or insights, provide them in a compact, structured format, including only the requested fields or details.
+        7. If errors occur in tool responses, note their impact and provide a best-effort analysis using available data.
+        8. Incorporate domain-specific guidance from '{user_analysis_prompt}' to align with the agent's predefined analytical approach.
+        9. Use bullet points, numbered lists, or tables for multiple items to enhance readability and reduce token usage.
+        10. Conclude with a brief summary of the most critical findings and their relevance to the task's goals.
 
-        ## Output Format
-        ```markdown
-        # Detailed Analysis
-
-        ## 1. Market Overview
-        ### Current Market Conditions
-        [Summary of market metrics, e.g., TVL, volumes, or positions]
-        ### Key Asset Performance
-        [Asset-specific metrics, trends, and analysis]
-
-        ## 2. Top-Performing Entities
-        [Details of key entities, e.g., protocols or whales, with metrics and strategies]
-
-        ## 3. Identified Patterns
-        [Behavioral or operational patterns, e.g., trading or protocol strategies]
-
-        ## 4. Risk Assessment
-        [Risk factors with table or list, including asset-specific risks]
-
-        ## 5. Market Trend Analysis
-        [Trend analysis for key assets or metrics, e.g., price, TVL]
-
-        ## 6. Recommendations
-        [Actionable recommendations with entry, stop loss, take profit, leverage, risk/reward, safety score, timeframe, and rationale]
-
-        ## 7. Conclusion
-        [Summary of findings, trends, and strategic advice]
-
-        ## Success
-        [true/false with brief explanation]
+        Ensure the response is complete, actionable, and tailored to the task, omitting extraneous information.
         ```
         """
     )
