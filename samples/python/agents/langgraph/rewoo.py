@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from operator import add
 import json
 import traceback
@@ -18,6 +19,8 @@ from langgraph.graph import END, START
 from litellm import acompletion, completion_cost,completion
 from langgraph.types import Checkpointer
 from pydantic import BaseModel, ValidationError
+
+logger = logging.getLogger(__name__)
 
 class ModelUsage(BaseModel):
     total_cost: float
@@ -317,70 +320,112 @@ class ReWooAgent:
             print(f"Error initializing MCP client: {e}")
             raise e
 
-    # Worker: Execute all tool calls across all plan steps
     async def worker(self, state: PlannerState) -> WorkerState:
-        results: list[str] = []
-        for step in state.plan:
+        async def process_tool_call(tool_call: Dict) -> Dict:
+            """Process a single tool call."""
+            try:
+                server_url = self.tool_to_url.get(tool_call["name"])
+                if not server_url:
+                    raise ValueError(f"No server URL for tool {tool_call['name']}")
+                
+                response = await call_tool(
+                    tool_call["name"],
+                    tool_call.get("args", {}),
+                    server_url
+                )
+                
+                parsed_response_content: List[Dict] = []
+                if isinstance(response.content, list):
+                    for item in response.content:
+                        if isinstance(item, TextContent):
+                            parsed_response_content.append({
+                                "type": item.type,
+                                "text": item.text
+                            })
+                        elif isinstance(item, ImageContent):
+                            parsed_response_content.append({
+                                "type": item.type,
+                                "image": item.data,
+                                "mime_type": item.mimeType
+                            })
+                        elif isinstance(item, EmbeddedResource):
+                            if isinstance(item.resource, TextResourceContents):
+                                parsed_response_content.append({
+                                    "type": item.type,
+                                    "data": item.resource.text,
+                                    "mime_type": item.resource.mimeType
+                                })
+                            elif isinstance(item.resource, BlobResourceContents):
+                                parsed_response_content.append({
+                                    "type": item.type,
+                                    "data": item.resource.blob,
+                                    "mime_type": item.resource.mimeType
+                                })
+                            else:
+                                raise ValueError(f"Unsupported resource type: {type(item.resource)}")
+                        else:
+                            raise ValueError(f"Unsupported content type: {type(item)}")
+                
+                return {
+                    "name": tool_call["name"],
+                    "args": tool_call.get("args", {}),
+                    "response": parsed_response_content,
+                    "isError": response.isError
+                }
+            except Exception as e:
+                logger.error(f"Error executing MCP command {tool_call['name']}: {e}\nTraceback: {traceback.format_exc()}")
+                return {
+                    "name": tool_call["name"],
+                    "args": tool_call.get("args", {}),
+                    "error": str(e),
+                    "isError": True
+                }
+
+        async def process_step(step: Dict) -> str:
+            """Process a single step, running tool calls concurrently."""
             step_results = {
                 "step_description": step["description"],
                 "tool_responses": []
             }
-            for tool_call in step["tool_calls"]:
-                try:
-                    server_url = self.tool_to_url[tool_call["name"]]
-                    response = await call_tool(
-                        tool_call["name"], 
-                        tool_call.get("args", {}), 
-                        server_url
-                    )
-                    parsed_response_content: list[str] = []
-                    if isinstance(response.content, list):
-                        for item in response.content:
-                            if isinstance(item, TextContent):
-                                parsed_response_content.append({
-                                    "type": item.type, 
-                                    "text": item.text
-                                })
-                            elif isinstance(item, ImageContent):
-                                parsed_response_content.append({
-                                    "type": item.type, 
-                                    "image": item.data, 
-                                    "mime_type": item.mimeType
-                                })
-                            elif isinstance(item, EmbeddedResource):
-                                if isinstance(item.resource, TextResourceContents):
-                                    parsed_response_content.append({
-                                        "type": item.type, 
-                                        "data": item.resource.text, 
-                                        "mime_type": item.resource.mimeType
-                                    })
-                                elif isinstance(item.resource, BlobResourceContents):
-                                    parsed_response_content.append({
-                                        "type": item.type, 
-                                        "data": item.resource.blob, 
-                                        "mime_type": item.resource.mimeType
-                                    })
-                                else:
-                                    raise ValueError(
-                                        f"Unsupported resource type: {type(item.resource)}"
-                                    )
-                            else:
-                                raise ValueError(f"Unsupported content type: {type(item)}")
-                    result = {
-                        "response": parsed_response_content,
-                        "isError": response.isError
-                    } if response else {"error": "No response received"}
-                except Exception as e:
-                    print(f"Error executing MCP command {tool_call['name']}: {e}")
-                    result = {"error": str(e), "isError": True}
-                step_results["tool_responses"].append({
-                    "name": tool_call["name"],
-                    "args": tool_call.get("args", {}),
-                    **result
-                })
-            results.append(f"\n<result>{json.dumps(step_results)}</result>\n")
+            tool_calls = step.get("tool_calls", [])
+            if tool_calls:
+                # Run all tool calls concurrently
+                tool_results = await asyncio.gather(
+                    *(process_tool_call(tool_call) for tool_call in tool_calls),
+                    return_exceptions=True
+                )
+                # Collect results, handling any exceptions
+                for result in tool_results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Tool call failed: {result}\nTraceback: {traceback.format_exc()}")
+                        step_results["tool_responses"].append({
+                            "name": "unknown",
+                            "args": {},
+                            "error": str(result),
+                            "isError": True
+                        })
+                    else:
+                        step_results["tool_responses"].append(result)
+            
+            return f"\n<result>{json.dumps(step_results)}</result>\n"
+
+        # Run all steps concurrently
+        results = await asyncio.gather(
+            *(process_step(step) for step in state.plan),
+            return_exceptions=True
+        )
+        
+        # Handle any step-level exceptions
+        final_results: list[str] = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Step processing failed: {result}\nTraceback: {traceback.format_exc()}")
+                final_results.append(f"\n<result>{json.dumps({"name":"unknown", "args": {}, "error": str(result), "isError": True})}</result>\n")
+            else:
+                final_results.append(result)
+
         return {
-            "mcp_results": results,
+            "mcp_results": final_results,
             "type": "worker"
         }
 
