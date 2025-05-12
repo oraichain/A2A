@@ -1,10 +1,9 @@
 import asyncio
 import logging
-from operator import add
 import json
 import re
 import traceback
-from typing import Annotated, Literal, Optional, List, Dict, Any, Union
+from typing import Annotated, Literal, Optional, List, Dict, Any, Tuple, Union
 import asyncio
 import uuid
 from langgraph.graph import StateGraph
@@ -23,6 +22,7 @@ from litellm import acompletion, completion_cost, model_list
 from langgraph.types import Checkpointer
 from pydantic import BaseModel, ValidationError
 from langchain_core.runnables.config import RunnableConfig
+import tiktoken
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,16 @@ def add_with_trim(current_messages: list[dict], new_messages: list[dict]) -> lis
     else:
         condensed_messages = current_messages
     return condensed_messages
+
+def remove_json_comments(json_str):
+    # Remove single-line comments (// ...)
+    json_str = re.sub(r'//.*?\n', '\n', json_str)
+    return json_str
+
+def count_tokens(text: str) -> int:
+    """Count tokens using tiktoken."""
+    encoding = tiktoken.encoding_for_model("gpt-4o")
+    return len(encoding.encode(text))
 
 class ModelUsage(BaseModel):
     total_cost: float
@@ -121,6 +131,11 @@ StructuredResponseSchema = Union[dict, type[BaseModel]]
     
 DEFAULT_PLANNER_USER_PROMPT = """
 You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
+
+Parse all the active whale token trades in the <active_whale_token_trades></active_whale_token_trades> XML tag.
+Include from 10 to 20 active whale token trades in the <active_whale_token_trades></active_whale_token_trades> XML tag when calling tools that require tokens as arguments.
+
+If there is no <active_whale_token_trades></active_whale_token_trades> XML tag, you can safely ignore it.
 """
 
 DEFAULT_ANALYSIS_USER_PROMPT = """
@@ -198,6 +213,40 @@ async def execute_call_tool(tool_name: str, args: Dict, sse_server_url: str) -> 
                     content=[TextContent(text=f'Error executing tool: {str(e)}', type='text')],
                     isError=True
                 )
+
+def parse_tool_result(tool_result: CallToolResult) -> List[Dict]:
+    parsed_response_content: List[Dict] = []
+    if isinstance(tool_result.content, list):
+        for item in tool_result.content:
+            if isinstance(item, TextContent):
+                parsed_response_content.append({
+                    "type": item.type,
+                    "text": item.text
+                })
+            elif isinstance(item, ImageContent):
+                parsed_response_content.append({
+                    "type": item.type,
+                    "image": item.data,
+                    "mime_type": item.mimeType
+                })
+            elif isinstance(item, EmbeddedResource):
+                if isinstance(item.resource, TextResourceContents):
+                    parsed_response_content.append({
+                        "type": item.type,
+                        "data": item.resource.text,
+                        "mime_type": item.resource.mimeType
+                    })
+                elif isinstance(item.resource, BlobResourceContents):
+                    parsed_response_content.append({
+                        "type": item.type,
+                        "data": item.resource.blob,
+                        "mime_type": item.resource.mimeType
+                    })
+                else:
+                    raise ValueError(f"Unsupported resource type: {type(item.resource)}")
+            else:
+                raise ValueError(f"Unsupported content type: {type(item)}")
+    return parsed_response_content
 
 def convert_langchain_schema_to_json_schema(schema: Any) -> Dict[str, Any]:
     """
@@ -464,6 +513,23 @@ class ReWooAgent:
         memory_id = config["metadata"]["task_id"]
         await store.aput(namespace=namespace, key=memory_id, value={"analysis": analysis_content}, index=["analysis"], ttl=self.memory_ttl)
         
+    # NOTE: trick to save active whale token trades, so that we can use it for analysis or other tool calls
+    async def _presave_active_whale_token_trades(self, config: RunnableConfig, store: BaseStore) -> str:
+        key = "active_whale_token_trades"
+        tool_name = "perp_whales_open_pos_tokens"
+        namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
+        result = await store.aget(namespace, key=key)
+        # if None -> we intentionally call the tool to get the active whale token trades
+        if result is None:
+            tool_result = await call_tool(tool_name, {}, self.tool_to_url[tool_name])
+            parsed_tool_result = parse_tool_result(tool_result)
+            tokens = parsed_tool_result[0].get("text", "") if len(parsed_tool_result) > 0 else ""
+            await store.aput(namespace=namespace, key=key, value={"active_whale_token_trades": tokens}, ttl=self.memory_ttl)
+            return json.dumps(f"<active_whale_token_trades>{tokens}</active_whale_token_trades>")
+        else:
+            return json.dumps(f"<active_whale_token_trades>{result.value.get("active_whale_token_trades", "")}</active_whale_token_trades>")
+        
+        
     async def _load_previous_analysis_from_knowledge_base(self, task: str, config: RunnableConfig, store: BaseStore) -> str:
         namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
         result = await store.asearch(namespace, query=task, limit=5)
@@ -473,9 +539,9 @@ class ReWooAgent:
             logger.info(f"Prev analysis updated_at: {res.updated_at}")
         prev_analysis_messages = [
             {"role": "assistant", "content": [{"text": res.value.get('analysis', ''), "type": "text"}]}
-            for res in result if res.score > 0.5
+            # NOTE: why 0.4?
+            for res in result if res.score and res.score >= 0.4
         ]
-        logger.info(f"Previous analysis messages length: {len(prev_analysis_messages)}")
         if len(prev_analysis_messages) > 0:
             first_text = prev_analysis_messages[0]["content"][0]["text"]
             prev_analysis_messages[0]["content"][0]["text"] = f"<previous_analysis>\n{first_text}\n"
@@ -497,38 +563,7 @@ class ReWooAgent:
                     server_url
                 )
                 
-                parsed_response_content: List[Dict] = []
-                if isinstance(response.content, list):
-                    for item in response.content:
-                        if isinstance(item, TextContent):
-                            parsed_response_content.append({
-                                "type": item.type,
-                                "text": item.text
-                            })
-                        elif isinstance(item, ImageContent):
-                            parsed_response_content.append({
-                                "type": item.type,
-                                "image": item.data,
-                                "mime_type": item.mimeType
-                            })
-                        elif isinstance(item, EmbeddedResource):
-                            if isinstance(item.resource, TextResourceContents):
-                                parsed_response_content.append({
-                                    "type": item.type,
-                                    "data": item.resource.text,
-                                    "mime_type": item.resource.mimeType
-                                })
-                            elif isinstance(item.resource, BlobResourceContents):
-                                parsed_response_content.append({
-                                    "type": item.type,
-                                    "data": item.resource.blob,
-                                    "mime_type": item.resource.mimeType
-                                })
-                            else:
-                                raise ValueError(f"Unsupported resource type: {type(item.resource)}")
-                        else:
-                            raise ValueError(f"Unsupported content type: {type(item)}")
-                
+                parsed_response_content = parse_tool_result(response)
                 return {
                     "name": tool_call["name"],
                     "args": tool_call.get("args", {}),
@@ -544,7 +579,7 @@ class ReWooAgent:
                     "isError": True
                 }
 
-        async def process_step(step: Dict) -> str:
+        async def process_step(step: Dict):
             """Process a single step, running tool calls concurrently."""
             step_results = {
                 "step_description": step["description"],
@@ -570,7 +605,7 @@ class ReWooAgent:
                     else:
                         step_results["tool_responses"].append(result)
             
-            return f"\n<result>{json.dumps(step_results)}</result>\n"
+            return step_results
 
         # Run all steps concurrently
         results = await asyncio.gather(
@@ -585,7 +620,7 @@ class ReWooAgent:
                 logger.error(f"Step processing failed: {result}\nTraceback: {traceback.format_exc()}")
                 final_results.append(f"\n<result>{json.dumps({"name":"unknown", "args": {}, "error": str(result), "isError": True})}</result>\n")
             else:
-                final_results.append(result)
+                final_results.append(f"\n<result>{json.dumps(result)}</result>\n")
 
         return {
             "mcp_results": final_results,
@@ -617,7 +652,11 @@ class ReWooAgent:
             ]
         }
         previous_analysis_messages = await self._load_previous_analysis_from_knowledge_base(state.task, config, store)
-        messages = [system_message, task_message, *previous_analysis_messages]
+        # NOTE: trick to save active whale token trades, so that we can use it for analysis or other tool calls
+        active_whale_token_trades = await self._presave_active_whale_token_trades(config, store)
+        logger.info(f"Active whale token trades: {active_whale_token_trades}")
+        active_whale_token_trades_message = {"role": "assistant", "content": [{"text": active_whale_token_trades, "type": "text"}]}
+        messages = [system_message, task_message, *previous_analysis_messages, active_whale_token_trades_message]
     
         # Format tools for Anthropic
         formatted_tools = get_formatted_tools(self.planner_model.model, self.tools)
@@ -640,9 +679,9 @@ class ReWooAgent:
         cache_write_tokens = token_data.get('cache_write_tokens', 0)
         
         logger.info(f"Planner response: {response.choices[0].message.content}")
-        
+        sanitized_plan = remove_json_comments(response.choices[0].message.content)
         try:
-            plan = json.loads(response.choices[0].message.content)
+            plan = json.loads(sanitized_plan)
             if not isinstance(plan, list):
                 raise ValueError("Plan must be a JSON array")
                 
