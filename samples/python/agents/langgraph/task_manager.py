@@ -45,12 +45,13 @@ class AgentTaskManager(InMemoryTaskManager):
         
     async def accumulate_model_usage(self, model_usage: ModelUsage):
         async with self.session_lock:
-            self.total_usage.total_cost += model_usage.total_cost
-            self.total_usage.total_tokens += model_usage.total_tokens
-            self.total_usage.prompt_tokens += model_usage.prompt_tokens
-            self.total_usage.completion_tokens += model_usage.completion_tokens
-            self.total_usage.cache_read_tokens += model_usage.cache_read_tokens
-            self.total_usage.cache_write_tokens += model_usage.cache_write_tokens
+            if model_usage:
+                self.total_usage.total_cost += model_usage.total_cost
+                self.total_usage.total_tokens += model_usage.total_tokens
+                self.total_usage.prompt_tokens += model_usage.prompt_tokens
+                self.total_usage.completion_tokens += model_usage.completion_tokens
+                self.total_usage.cache_read_tokens += model_usage.cache_read_tokens
+                self.total_usage.cache_write_tokens += model_usage.cache_write_tokens
 
     async def _run_streaming_agent(self, request: SendTaskStreamingRequest):
         task_send_params: TaskSendParams = request.params
@@ -71,8 +72,8 @@ class AgentTaskManager(InMemoryTaskManager):
                     task_state = TaskState.COMPLETED
                     artifact = Artifact(parts=parts, index=0, append=False)
                     end_stream = True
-                    model_usage = item["model_usage"]
-                    await self.accumulate_model_usage(model_usage)
+                    if "model_usage" in item:
+                        await self.accumulate_model_usage(item["model_usage"])
                     logger.info(f"Total model usage as of now: {self.total_usage}")
                     
                 elif not is_task_complete and not require_user_input:
@@ -107,6 +108,7 @@ class AgentTaskManager(InMemoryTaskManager):
 
         except Exception as e:
             logger.error(f"An error occurred while streaming the response: {e}")
+            print(traceback.format_exc())
             await self.enqueue_events_for_sse(
                 task_send_params.id,
                 InternalError(

@@ -28,7 +28,7 @@ def main(host, port):
             raise MissingAPIKeyError("LLM_MODEL environment variable not set.")
 
         description = """
-        A skillful DeFi Analysis Agent. Analyze whale trading patterns, positions, and portfolio changes over time. Provide insights and trade suggestions. I don't store or remember any previous crawled or analyzed data. However, if you provide your knowledge or data, put them in the <knowledge_gathered></knowledge_gathered> tag. I will use it along with the latest data fetched from the tools I have to provide you with the best possible analysis.
+        Analyze whale trading patterns, positions, and portfolio changes over time. Provide insights and trade suggestions.
         """
         capabilities = AgentCapabilities(streaming=True)
         skill = AgentSkill(
@@ -51,7 +51,7 @@ def main(host, port):
         agent = ReWOOAgentWrapper(
             sse_mcp_server_sessions={
                 'hyperwhales': {
-                    'url': "http://15.235.225.246:4010/sse",
+                    'url': "http://localhost:4000/sse",
                     'transport': 'sse',
                 }
             }

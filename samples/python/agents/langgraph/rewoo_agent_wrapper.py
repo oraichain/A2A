@@ -5,11 +5,22 @@ import os
 import traceback
 from common.types import FilePart, TextPart
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.memory import InMemoryStore
+from langchain.embeddings import init_embeddings
 from typing import Any, Dict, AsyncIterable, List, Tuple
 from rewoo import InitState, ModelUsage, PlannerModel, AnalysisModel, PlannerState, SolverState, WorkerState, create_rewoo_agent, is_init_state, is_planner_state, is_worker_state, is_solver_state
 from langchain_mcp_adapters.client import SSEConnection
+from langchain_core.runnables.config import RunnableConfig
 
 memory = MemorySaver()
+# memory = None
+store = InMemoryStore(
+    index={
+        "embed": init_embeddings("openai:text-embedding-3-small"),  # Embedding provider
+        "dims": 1536,                               # Embedding dimensions
+        "fields": ["analysis"]              # Fields to embed
+    }
+)
 logger = logging.getLogger(__name__)
 
 class ReWOOAgentWrapper:
@@ -29,11 +40,17 @@ class ReWOOAgentWrapper:
             sse_mcp_server_sessions=self.sse_mcp_server_sessions,
             planner_model=self.planner_model,
             analysis_model=self.analysis_model,
+            checkpointer=memory,
+            store=store,
         )
 
     async def stream(self, query: str, session_id: str, task_id: str) -> AsyncIterable[Dict[str, Any]]:
-        inputs = InitState(task=query)
-        config = {"configurable": {"thread_id": f"{session_id}_{task_id}"}}
+        config: RunnableConfig = RunnableConfig(configurable={"thread_id": f"{session_id}"}, metadata={"task_id": f"{task_id}"})
+        messages = []
+        if memory:
+            graph_state = self.graph.get_state(config=config)
+            messages = graph_state.values["messages"] if graph_state.values and "messages" in graph_state.values else []
+        inputs = InitState(task=query, messages=messages)
         logger.info(f"Stream for session {session_id} with task {task_id} started with query: {query}")
 
         try:
@@ -44,7 +61,9 @@ class ReWOOAgentWrapper:
                 yield {
                     "is_task_complete": True,
                     "require_user_input": False,
-                    "content": "Task timed out",
+                    "content": [TextPart(type="text", text="Task timed out")],
+                    "images": [],
+                    "model_usage": None,
                 }
         except Exception as e:
             logger.error(f"Error in stream for session {session_id} with task {task_id}: {e}")
@@ -52,7 +71,8 @@ class ReWOOAgentWrapper:
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
-                "content": f"Error: {str(e)}",
+                "content": [TextPart(type="text", text=f"Error: {str(e)}")],
+                "images": [],
             }
         finally:
             logger.info(f"Stream for session {session_id} and task {task_id} completed")
@@ -72,6 +92,8 @@ class ReWOOAgentWrapper:
             state = is_planner_state(event) or is_worker_state(event)
             if state:
                 content, images = self.extract_message_content(state)
+                if is_planner_state(state):
+                    logger.info(f"Planner state: {content}")
                 return {
                     "is_task_complete": False,
                     "require_user_input": False,

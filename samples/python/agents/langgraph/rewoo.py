@@ -2,11 +2,13 @@ import asyncio
 import logging
 from operator import add
 import json
+import re
 import traceback
 from typing import Annotated, Literal, Optional, List, Dict, Any, Union
 import asyncio
 import uuid
 from langgraph.graph import StateGraph
+from langgraph.store.base import BaseStore
 from langgraph.graph.state import CompiledStateGraph
 from langchain_core.prompts import PromptTemplate
 from langchain_mcp_adapters.client import MultiServerMCPClient, SSEConnection
@@ -14,13 +16,27 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.types import CallToolResult, TextContent, ImageContent, EmbeddedResource, TextResourceContents, BlobResourceContents
 from langchain_core.tools import StructuredTool, BaseTool
-from langchain_core.messages import AnyMessage, HumanMessage, AIMessage
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START
-from litellm import acompletion, completion_cost,completion
+from litellm import acompletion, completion_cost, model_list
 from langgraph.types import Checkpointer
 from pydantic import BaseModel, ValidationError
+from langchain_core.runnables.config import RunnableConfig
 
 logger = logging.getLogger(__name__)
+
+# NOTE: currently we don't use messages as conversation history. Right now it's just a reserve for future use.
+# This function prevents overbloating the memory.
+def add_with_trim(current_messages: list[dict], new_messages: list[dict]) -> list[dict]:
+    condensed_messages = current_messages + new_messages
+    # NOTE: why 10? for simplicity, we can change it later
+    if len(condensed_messages) > 10:
+        # get the last 10 messages
+        condensed_messages = current_messages[-10:]
+    else:
+        condensed_messages = current_messages
+    return condensed_messages
 
 class ModelUsage(BaseModel):
     total_cost: float
@@ -32,7 +48,7 @@ class ModelUsage(BaseModel):
     
 # Define the ReWOO states
 class ReWOOState(BaseModel):
-    messages: Annotated[List[AnyMessage], add] # conversation history with reducer to automatically add new messages
+    messages: Annotated[list[dict], add_with_trim] # conversation history with reducer to automatically add new messages
     task: str
     plan: List[Dict[str, Any]]
     mcp_results: list[str]
@@ -41,6 +57,7 @@ class ReWOOState(BaseModel):
     type: Literal["init", "planner", "worker", "solver"]
     
 class InitState(BaseModel):
+    messages: Annotated[list[dict], add_with_trim] # conversation history with reducer to automatically add new messages
     task: str
     type: Literal["init"] = "init"
     
@@ -51,12 +68,14 @@ class PlannerState(BaseModel):
     type: Literal["planner"] = "planner"
 
 class WorkerState(BaseModel):
+    messages: Annotated[list[dict], add_with_trim] # conversation history with reducer to automatically add new messages
     task: str
     mcp_results: list[str]
     model_usage: ModelUsage
     type: Literal["worker"] = "worker"
 
 class SolverState(BaseModel):
+    messages: Annotated[list[dict], add_with_trim] # conversation history with reducer to automatically add new messages
     task: str
     analysis: str
     model_usage: ModelUsage
@@ -180,13 +199,118 @@ async def execute_call_tool(tool_name: str, args: Dict, sse_server_url: str) -> 
                     isError=True
                 )
 
+def convert_langchain_schema_to_json_schema(schema: Any) -> Dict[str, Any]:
+    """
+    Convert a LangChain args_schema (Pydantic model or dict) to a JSON schema.
+    """
+    if schema is None:
+        return {"type": "object", "properties": {}, "required": []}
+    
+    if isinstance(schema, dict):
+        # If already a dict, ensure it has required JSON schema fields
+        if "type" not in schema:
+            schema["type"] = "object"
+        if "properties" not in schema:
+            schema["properties"] = {}
+        if "required" not in schema:
+            schema["required"] = []
+        return schema
+    
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        # Convert Pydantic model to JSON schema
+        try:
+            return schema.model_json_schema()
+        except Exception as e:
+            print(f"Error converting Pydantic schema to JSON: {e}")
+            return {"type": "object", "properties": {}, "required": []}
+    
+    raise ValueError(f"Unsupported schema type: {type(schema)}")
+
+def to_anthropic_tools(tools: List[BaseTool]) -> List[Dict[str, Any]]:
+    """
+    Convert LangChain BaseTool list to Anthropic-compatible tool format.
+    """
+    formatted_tools = []
+    for tool in tools:
+        try:
+            # Ensure schema is compatible with Anthropic
+            schema = tool.args_schema or {
+                "type": "object", 
+                "properties": {}, 
+                "required": []
+            }
+            if isinstance(schema, dict) and "type" not in schema:
+                schema["type"] = "object"
+            formatted_tools.append({
+                "name": tool.name,
+                "description": tool.description or f"Tool: {tool.name}",
+                "input_schema": schema
+            })
+        except Exception as e:
+            print(f"Error formatting tool {tool.name}: {e}")
+            continue
+    
+    return formatted_tools
+
+def to_openai_tools(tools: List[BaseTool]) -> List[Dict[str, Any]]:
+    """
+    Convert LangChain BaseTool list to OpenAI-compatible tool format.
+    """
+    formatted_tools = []
+    for tool in tools:
+        try:
+            # Convert args_schema to JSON schema
+            input_schema = convert_langchain_schema_to_json_schema(tool.args_schema)
+            
+            # Ensure schema is OpenAI-compatible
+            if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
+                input_schema = {"type": "object", "properties": {}, "required": []}
+            
+            # OpenAI expects 'parameters' instead of 'input_schema'
+            formatted_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or f"Tool: {tool.name}",
+                    "parameters": input_schema
+                }
+            })
+        except Exception as e:
+            print(f"Error formatting tool {tool.name} for OpenAI: {e}")
+            continue
+    
+    return formatted_tools
+
+# Function to detect model type and filter tools
+def get_formatted_tools(model_name: str, tools: List[BaseTool]) -> List[Dict[str, Any]]:
+    """
+    Detect the model type (Anthropic or OpenAI) and return tools in the appropriate format.
+    
+    Args:
+        model: The model instance (e.g., ChatAnthropic, ChatOpenAI, or other).
+        tools: List of LangChain BaseTool objects.
+    
+    Returns:
+        List of formatted tools compatible with the model.
+    
+    Raises:
+        ValueError: If the model type is not recognized.
+    """
+    # Method 1: Check instance type
+    model_name = model_name.lower()
+    if re.search(r"claude", model_name):
+        return to_anthropic_tools(tools)
+    elif re.search(r"gpt|o1|grok", model_name):
+        return to_openai_tools(tools)
+    else:
+        raise ValueError(f"Could not determine model type for {model_name}. Please ensure it's an Anthropic or OpenAI model.")
+
 class ReWooAgent:    
     def __init__(
         self,
         sse_mcp_server_sessions: dict[str, SSEConnection],
         planner_model: PlannerModel,
         analysis_model: AnalysisModel,
-        checkpointer: Optional[Checkpointer] = None,
         user_prompt: str = DEFAULT_PLANNER_USER_PROMPT,
         user_analysis_prompt: str = DEFAULT_ANALYSIS_USER_PROMPT,
         ):
@@ -198,24 +322,49 @@ class ReWooAgent:
             self.tools: list[BaseTool] = []
             self.mcp_server_name_to_tools: dict[str, list[BaseTool]] = {}
             self.tool_to_url: dict[str, str] = {}
-            self.checkpointer = checkpointer
             
     # Planner: Generate a structured plan using litellm
     planner_prompt = PromptTemplate(
-        input_variables=["task", "tools", "user_prompt"],
+        input_variables=["tools", "user_prompt"],
         template="""
         {user_prompt}
             
-        Create a step-by-step plan in JSON format to accomplish the task: {task}
+        Create a step-by-step plan in JSON format to accomplish the task provided in <task></task> XML tag.
 
-        Available MCP tools: {tools}
+        Available MCP tool names are provided in <tools></tools> XML tag.
         
-        Extract the already gathered information from the user, which is provided in <knowledge_gathered></knowledge_gathered> XML tag, and use it to inform the plan and call tools appropriately. Refrain from calling tools if you already have the information in the <knowledge_gathered></knowledge_gathered> XML tag. If there is no <knowledge_gathered></knowledge_gathered> XML tag, you can safely ignore it.
+        Extract the already gathered information from the user, which is provided in <knowledge_gathered></knowledge_gathered> XML tag, and use it to inform the plan and call tools appropriately. 
+        Refrain from calling tools if you already have the information in the <knowledge_gathered></knowledge_gathered> XML tag.
+        If there is no <knowledge_gathered></knowledge_gathered> XML tag, you can safely ignore it.
+        
+        Also, previous task and analysis results are provided in <previous_analysis></previous_analysis> XML tags.
+        There can be multiple <previous_analysis></previous_analysis> XML tags. 
+        Refrain from calling tools if you already have the information in the <previous_analysis></previous_analysis> XML tags.
+        If the previous analysis complements the current plan, use it to inform the plan.
+        If there is no <previous_analysis></previous_analysis> XML tag, you can safely ignore it.
 
         Each step must be a JSON object with a 'description' (string) and a 'tool_calls' array. The description should be at within 2-3 sentences per step. 
         Each tool call is an object with 'name' (string, matching an MCP tool) and 'args' (object). Also, keep the tool calls minimal and only use as many as needed to fully satisfy the task's requirements efficiently.
+                
+        Example of the input format:
+        
+        <tools>
+        tool1, tool2, tool3
+        </tools>
+        <task>
+        Task description
+        <knowledge_gathered>
+        Knowledge gathered
+        </knowledge_gathered>
+        </task>
+        <previous_analysis>
+        Previous analysis
+        </previous_analysis>
+        <previous_analysis>
+        Previous analysis
+        </previous_analysis>
 
-        Example format:
+        Example of the output format:
         [
         {{
             "description": "Step 1",
@@ -232,20 +381,27 @@ class ReWooAgent:
         }}
         ]
 
-        Return only the JSON array, nothing else."""
+        Return only the JSON array, nothing else. Do not put any comments in the JSON array.
+        If you cannot come up with a plan, return a plan with 1 step, no tool calls, and a description of what you will do to complete the task.
+        Below are the actual task, knowledge gathered, previous analysis, and tools. Proceed and generate the plan. Good luck!
+        
+        <tools>
+        {tools}
+        </tools>
+        """
     )
                 
     # Analysis and Summary Prompts
     analysis_prompt = PromptTemplate(
-        input_variables=["task", "user_analysis_prompt"],
+        input_variables=["user_analysis_prompt"],
         template="""
         
         # Detailed Analysis
 
-        You are an expert AI assistant tasked with analyzing the results of the task '{task}' provided in <result></result> XML tags. Multiple tags indicate multiple tool calls. Your goal is to deliver a concise, precise response that fully satisfies the main agent's request while minimizing token usage and providing deep analysis of key metrics, relationships, and their implications.
+        You are an expert AI assistant tasked with analyzing the results of the task provided in <task></task> XML tag.
+        Multiple <result></result> XML tags indicate multiple tool calls. Your goal is to deliver a detailed and comprehensive analysis that fully satisfies the main agent's request with key metrics, relationships, and their implications.
 
         1. Parse JSON data in each <result></result> tag, containing "step_description" and "tool_responses" (with "name", "args", "isError", "response").
-        2. Extract the already gathered information from the user, which is provided in <knowledge_gathered></knowledge_gathered> XML tag, and use it for analysis, key metrics, finding relationships between knowledge gathered and tool responses.
         3. Synthesize results to directly address the task's requirements, focusing on essential details and avoiding redundancy.
         4. Identify and highlight key metrics, patterns, and relationships across tool responses. Explain their implications for the task's objectives in a clear, actionable manner.
         5. Structure the response to match the task's requested format (e.g., lists, tables, or summaries) to ensure clarity and completeness.
@@ -256,6 +412,29 @@ class ReWooAgent:
         10. Conclude with a brief summary of the most critical findings and their relevance to the task's goals.
 
         Ensure the response is complete, actionable, and tailored to the task, omitting extraneous information.
+        
+        Also, previous task and analysis results are provided in <previous_analysis></previous_analysis> XML tags. 
+        There can be multiple <previous_analysis></previous_analysis> XML tags.
+        Use it to inform the analysis. Refrain from calling tools if you already have the information in the <previous_analysis></previous_analysis> XML tags.
+        If the previous analysis complements the current analysis, use it to inform the analysis.
+        If there is no <previous_analysis></previous_analysis> XML tag, you can safely ignore it.
+        
+        Example of the input format:
+        <task>
+        Task description
+        </task>
+        <previous_analysis>
+        Previous analysis
+        </previous_analysis>
+        <previous_analysis>
+        Previous analysis
+        </previous_analysis>
+        <result>
+        Result
+        </result>
+        <result>
+        Result
+        </result>
         ```
         """
     )
@@ -276,6 +455,27 @@ class ReWooAgent:
         except Exception as e:
             print(f"Error initializing MCP client: {e}")
             raise e
+        
+    def _store_analysis_into_knowledge_base(self, config: RunnableConfig, store: BaseStore, analysis_content: str) -> None:
+        namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
+        memory_id = config["metadata"]["task_id"]
+        store.put(namespace=namespace, key=memory_id, value={"analysis": analysis_content}, index=["analysis"])
+        
+    def _load_previous_analysis_from_knowledge_base(self, task: str, config: RunnableConfig, store: BaseStore) -> str:
+        namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
+        result = store.search(namespace, query=task, limit=5)
+        logger.info(f"Previous analysis result: {result}")
+        prev_analysis_messages = [
+            {"role": "assistant", "content": [{"text": res.value.get('analysis', ''), "type": "text"}]}
+            for res in result if res.score > 0.5
+        ]
+        logger.info(f"Previous analysis messages length: {len(prev_analysis_messages)}")
+        if len(prev_analysis_messages) > 0:
+            first_text = prev_analysis_messages[0]["content"][0]["text"]
+            prev_analysis_messages[0]["content"][0]["text"] = f"<previous_analysis>\n{first_text}\n"
+            last_text = prev_analysis_messages[-1]["content"][0]["text"]
+            prev_analysis_messages[-1]["content"][0]["text"] = f"{last_text}\n</previous_analysis>\n"
+        return prev_analysis_messages
 
     async def worker(self, state: PlannerState) -> WorkerState:
         async def process_tool_call(tool_call: Dict) -> Dict:
@@ -386,38 +586,40 @@ class ReWooAgent:
             "type": "worker"
         }
 
-    async def planner(self, state: InitState) -> PlannerState:
-        prompt = self.planner_prompt.format(
-            task=state.task, 
+    async def planner(self, state: InitState, config: RunnableConfig, *, store: BaseStore) -> PlannerState:
+        system_prompt = self.planner_prompt.format(
             tools=json.dumps([tool.name for tool in self.tools]), 
             user_prompt=self.user_prompt
         )
+        system_message = {
+            "role": "system",
+            "content": [
+                {
+                    "text": system_prompt,
+                    "type": "text",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        }
+        task_message = {
+            "role": "user",
+            "content": [
+                {
+                    "text": f"<task>{state.task}</task>",
+                    "type": "text",
+                }
+            ]
+        }
+        previous_analysis_messages = self._load_previous_analysis_from_knowledge_base(state.task, config, store)
+        messages = [system_message, task_message, *previous_analysis_messages]
     
         # Format tools for Anthropic
-        formatted_tools = []
-        for tool in self.tools:
-            try:
-                # Ensure schema is compatible with Anthropic
-                schema = tool.args_schema or {
-                    "type": "object", 
-                    "properties": {}, 
-                    "required": []
-                }
-                if isinstance(schema, dict) and "type" not in schema:
-                    schema["type"] = "object"
-                formatted_tools.append({
-                    "name": tool.name,
-                    "description": tool.description or f"Tool: {tool.name}",
-                    "input_schema": schema
-                })
-            except Exception as e:
-                print(f"Error formatting tool {tool.name}: {e}")
-                continue
+        formatted_tools = get_formatted_tools(self.planner_model.model, self.tools)
         
         # Use litellm for completion
         response = await acompletion(
             model=self.planner_model.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             api_key=self.planner_model.api_key,
             tools=formatted_tools
         )
@@ -431,27 +633,15 @@ class ReWooAgent:
         cache_read_tokens = token_data.get('cache_read_tokens', 0)
         cache_write_tokens = token_data.get('cache_write_tokens', 0)
         
+        logger.info(f"Planner response: {response.choices[0].message.content}")
+        
         try:
             plan = json.loads(response.choices[0].message.content)
             if not isinstance(plan, list):
                 raise ValueError("Plan must be a JSON array")
                 
-            ai_messages = [
-                AIMessage(
-                    content=step["description"],
-                    tool_calls=[
-                        {**tool_call, "id": str(uuid.uuid4())}
-                        for tool_call in step["tool_calls"]
-                    ]
-                )
-                for step in plan
-            ]
             return {
                 "plan": plan,
-                "messages": [
-                    HumanMessage(content=state.task),
-                    *ai_messages
-                ],
                 "model_usage": {
                     "total_cost": cost,
                     "total_tokens": total_tokens,
@@ -469,22 +659,31 @@ class ReWooAgent:
                 "tool_calls": [{"name": "list_resources", "args": {}, "id": str(uuid.uuid4())}]
             }]
         return {
-            "plan": [],
-            "messages": [
-                HumanMessage(content=state.task),
-            ],
+            "type": "planner"
         }
         
     # Solver: Analyze and summarize all worker results using litellm
-    async def solver(self, state: WorkerState) -> SolverState:
+    async def solver(self, state: WorkerState, config: RunnableConfig, *, store: BaseStore) -> SolverState:
         try:
             # Generate analysis
             analysis_input = self.analysis_prompt.format(
-                task=state.task,
                 user_analysis_prompt=self.user_analysis_prompt
             )
-            messages = [{"role": "user", "content": analysis_input}]
-            messages.extend([{"role": "user", "content": result} for result in state.mcp_results])
+            system_message = {
+                "role": "system",
+                "content": [
+                    {
+                        "text": analysis_input,
+                        "type": "text",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            }
+            task_message = {"role": "user", "content": [{"text": f"<task>{state.task}</task>", "type": "text"}]}
+            
+            previous_analysis_messages = self._load_previous_analysis_from_knowledge_base(state.task, config, store)
+            messages = [system_message, task_message, *previous_analysis_messages]
+            messages.extend([{"role": "assistant", "content": result} for result in state.mcp_results])  
             
             analysis_response = await acompletion(
                 model=self.analysis_model.model,
@@ -517,9 +716,15 @@ class ReWooAgent:
                 analysis_token_data.get('cache_write_tokens', 0)
             )
             
+            analysis_content = analysis_response.choices[0].message.content
+            self._store_analysis_into_knowledge_base(config, store, analysis_content)
+            
             return {
-                "analysis": analysis_response.choices[0].message.content,
-                "messages": [AIMessage(content=analysis_response.choices[0].message.content)],
+                "analysis": analysis_content,
+                "messages": [
+                    {"role": "user", "content": [{"text": f"<previous_analysis>\n{state.task}\n", "type": "text"}]},
+                    {"role": "assistant", "content": [{"text": f"{analysis_content}\n</previous_analysis>\n", "type": "text"}]}
+                ],
                 "model_usage": {
                     "total_cost": total_cost,
                     "total_tokens": total_tokens,
@@ -545,6 +750,7 @@ async def create_rewoo_agent(
     planner_model: PlannerModel,
     analysis_model: AnalysisModel,
     checkpointer: Optional[Checkpointer] = None,
+    store: Optional[BaseStore] = None,
     user_prompt: Optional[str] = None,
     user_analysis_prompt: Optional[str] = None,
 ) -> CompiledStateGraph:
@@ -555,7 +761,6 @@ async def create_rewoo_agent(
         planner_model: Model for planning steps
         analysis_model: Model for analyzing results
         solver_model: Model for solving/finalizing results
-        checkpointer: Optional checkpointer for state persistence
         user_prompt: Optional custom user prompt
         user_analysis_prompt: Optional custom analysis prompt
         
@@ -566,7 +771,6 @@ async def create_rewoo_agent(
         sse_mcp_server_sessions=sse_mcp_server_sessions,
         planner_model=planner_model,
         analysis_model=analysis_model,
-        checkpointer=checkpointer,
         user_prompt=user_prompt,
         user_analysis_prompt=user_analysis_prompt,
     )
@@ -585,4 +789,4 @@ async def create_rewoo_agent(
     workflow.add_edge("worker", "solver")
     workflow.add_edge("solver", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer, store=store)
