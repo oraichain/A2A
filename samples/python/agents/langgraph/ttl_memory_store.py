@@ -18,7 +18,7 @@ class TTLInMemoryStore(InMemoryStore):
         ttl: Union[Optional[float], "NotProvided"] = NOT_PROVIDED):
         super().put(namespace, key, value, index)
         # cleanup old data
-        
+        # NOTE: limit=10 for simplicity. In practice, we should use a more comprehensive approach.
         old_data = self.search(namespace, limit=10)
         for item in old_data:
             ttl_seconds = ttl * 60
@@ -38,7 +38,7 @@ class TTLInMemoryStore(InMemoryStore):
         ttl: Union[Optional[float], "NotProvided"] = NOT_PROVIDED):
         await super().aput(namespace, key, value, index)
         # cleanup old data
-        
+        # NOTE: limit=10 for simplicity. In practice, we should use a more comprehensive approach.
         old_data = self.search(namespace, limit=10)
         for item in old_data:
             ttl_seconds = ttl * 60
