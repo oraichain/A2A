@@ -5,16 +5,16 @@ import os
 import traceback
 from common.types import FilePart, TextPart
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
 from langchain.embeddings import init_embeddings
 from typing import Any, Dict, AsyncIterable, List, Tuple
 from rewoo import InitState, ModelUsage, PlannerModel, AnalysisModel, PlannerState, SolverState, WorkerState, create_rewoo_agent, is_init_state, is_planner_state, is_worker_state, is_solver_state
 from langchain_mcp_adapters.client import SSEConnection
 from langchain_core.runnables.config import RunnableConfig
+from ttl_memory_store import TTLInMemoryStore
 
 memory = MemorySaver()
 # memory = None
-store = InMemoryStore(
+store = TTLInMemoryStore(
     index={
         "embed": init_embeddings("openai:text-embedding-3-small"),  # Embedding provider
         "dims": 1536,                               # Embedding dimensions

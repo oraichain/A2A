@@ -322,6 +322,7 @@ class ReWooAgent:
             self.tools: list[BaseTool] = []
             self.mcp_server_name_to_tools: dict[str, list[BaseTool]] = {}
             self.tool_to_url: dict[str, str] = {}
+            self.memory_ttl: float = 15 # 15 minutes
             
     # Planner: Generate a structured plan using litellm
     planner_prompt = PromptTemplate(
@@ -344,7 +345,7 @@ class ReWooAgent:
         If there is no <previous_analysis></previous_analysis> XML tag, you can safely ignore it.
 
         Each step must be a JSON object with a 'description' (string) and a 'tool_calls' array. The description should be at within 2-3 sentences per step. 
-        Each tool call is an object with 'name' (string, matching an MCP tool) and 'args' (object). Also, keep the tool calls minimal and only use as many as needed to fully satisfy the task's requirements efficiently.
+        Each tool call is an object with 'name' (string, matching an MCP tool) and 'args' (object).
                 
         Example of the input format:
         
@@ -381,7 +382,9 @@ class ReWooAgent:
         }}
         ]
 
-        Return only the JSON array, nothing else. Do not put any comments in the JSON array.
+        Return only the JSON format, nothing else.
+        Do not include comments, notes in the JSON. For example: do not put // in the JSON.
+        It must be a valid JSON that can be loaded by Python using json.loads().
         If you cannot come up with a plan, return a plan with 1 step, no tool calls, and a description of what you will do to complete the task.
         Below are the actual task, knowledge gathered, previous analysis, and tools. Proceed and generate the plan. Good luck!
         
@@ -447,7 +450,7 @@ class ReWooAgent:
                 self.tools = tools
                 self.mcp_server_name_to_tools = mcp_client.server_name_to_tools
                 self.tool_to_url = create_tool_to_url_map(
-                    self.mcp_server_name_to_tools, 
+                    self.mcp_server_name_to_tools,
                     self.sse_mcp_server_sessions
                 )
                 if not tools:
@@ -456,15 +459,18 @@ class ReWooAgent:
             print(f"Error initializing MCP client: {e}")
             raise e
         
-    def _store_analysis_into_knowledge_base(self, config: RunnableConfig, store: BaseStore, analysis_content: str) -> None:
+    async def _store_analysis_into_knowledge_base(self, config: RunnableConfig, store: BaseStore, analysis_content: str) -> None:
         namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
         memory_id = config["metadata"]["task_id"]
-        store.put(namespace=namespace, key=memory_id, value={"analysis": analysis_content}, index=["analysis"])
+        await store.aput(namespace=namespace, key=memory_id, value={"analysis": analysis_content}, index=["analysis"], ttl=self.memory_ttl)
         
-    def _load_previous_analysis_from_knowledge_base(self, task: str, config: RunnableConfig, store: BaseStore) -> str:
+    async def _load_previous_analysis_from_knowledge_base(self, task: str, config: RunnableConfig, store: BaseStore) -> str:
         namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
-        result = store.search(namespace, query=task, limit=5)
-        logger.info(f"Previous analysis result: {result}")
+        result = await store.asearch(namespace, query=task, limit=5)
+        for res in result:
+            logger.info(f"Prev analysis score: {res.score}")
+            logger.info(f"Prev analysis value: {res.value}")
+            logger.info(f"Prev analysis updated_at: {res.updated_at}")
         prev_analysis_messages = [
             {"role": "assistant", "content": [{"text": res.value.get('analysis', ''), "type": "text"}]}
             for res in result if res.score > 0.5
@@ -610,7 +616,7 @@ class ReWooAgent:
                 }
             ]
         }
-        previous_analysis_messages = self._load_previous_analysis_from_knowledge_base(state.task, config, store)
+        previous_analysis_messages = await self._load_previous_analysis_from_knowledge_base(state.task, config, store)
         messages = [system_message, task_message, *previous_analysis_messages]
     
         # Format tools for Anthropic
@@ -681,7 +687,7 @@ class ReWooAgent:
             }
             task_message = {"role": "user", "content": [{"text": f"<task>{state.task}</task>", "type": "text"}]}
             
-            previous_analysis_messages = self._load_previous_analysis_from_knowledge_base(state.task, config, store)
+            previous_analysis_messages = await self._load_previous_analysis_from_knowledge_base(state.task, config, store)
             messages = [system_message, task_message, *previous_analysis_messages]
             messages.extend([{"role": "assistant", "content": result} for result in state.mcp_results])  
             
@@ -717,7 +723,7 @@ class ReWooAgent:
             )
             
             analysis_content = analysis_response.choices[0].message.content
-            self._store_analysis_into_knowledge_base(config, store, analysis_content)
+            await self._store_analysis_into_knowledge_base(config, store, analysis_content)
             
             return {
                 "analysis": analysis_content,
