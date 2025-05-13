@@ -22,6 +22,8 @@ from litellm import acompletion, completion_cost, model_list
 from langgraph.types import Checkpointer
 from pydantic import BaseModel, ValidationError
 from langchain_core.runnables.config import RunnableConfig
+from tokenizers import Tokenizer
+from transformers import GPT2TokenizerFast  # For pre-trained GPT-2 tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +129,7 @@ DEFAULT_PLANNER_USER_PROMPT = """
 You are an expert analyst specializing in detecting whale trading patterns. With years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies. You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
 
 Parse all the active whale token trades in the <active_whale_token_trades></active_whale_token_trades> XML tag.
-Include from 4-6 active whale token trades in the <active_whale_token_trades></active_whale_token_trades> XML tag when calling tools that require tokens as arguments.
+Include from 10 to 20 active whale token trades in the <active_whale_token_trades></active_whale_token_trades> XML tag when calling tools that require tokens as arguments.
 
 If there is no <active_whale_token_trades></active_whale_token_trades> XML tag, you can safely ignore it.
 """
@@ -348,6 +350,71 @@ def get_formatted_tools(model_name: str, tools: List[BaseTool]) -> List[Dict[str
     else:
         raise ValueError(f"Could not determine model type for {model_name}. Please ensure it's an Anthropic or OpenAI model.")
     
+def split_large_result(result: Dict, tokenizer: Tokenizer, max_tokens: int) -> List[str]:
+    """Split a large result into smaller chunks if it exceeds max_tokens."""
+    result_str = f"\n<result>{json.dumps(result)}</result>\n"
+    tokens = tokenizer.encode(result_str)
+    
+    if len(tokens) <= max_tokens:
+        return [result_str]
+
+    chunks = []
+    step_description = result.get("step_description", "")
+    tool_responses = result.get("tool_responses", [])
+
+    # Check token count of step_description
+    step_desc_tokens = tokenizer.encode(step_description)
+    if len(step_desc_tokens) > max_tokens // 2:
+        logger.warning("Step description itself is very large and may cause chunks to exceed token limit.")
+
+    current_chunk = {
+        "step_description": step_description,
+        "tool_responses": []
+    }
+
+    for response in tool_responses:
+        temp_chunk = {
+            "step_description": step_description,
+            "tool_responses": current_chunk["tool_responses"] + [response]
+        }
+        temp_str = f"\n<result>{json.dumps(temp_chunk)}</result>\n"
+        temp_tokens = tokenizer.encode(temp_str)
+
+        if len(temp_tokens) <= max_tokens:
+            current_chunk["tool_responses"].append(response)
+        else:
+            # Check if the current chunk is empty — i.e., single response is too large
+            if not current_chunk["tool_responses"]:
+                # Still include the large response as a separate chunk
+                oversized_chunk = {
+                    "step_description": step_description,
+                    "tool_responses": [response]
+                }
+                chunk_str = f"\n<result>{json.dumps(oversized_chunk)}</result>\n"
+                chunks.append(chunk_str)
+            else:
+                # Finalize the current chunk
+                chunk_str = f"\n<result>{json.dumps(current_chunk)}</result>\n"
+                chunks.append(chunk_str)
+                # Start a new chunk with the current response
+                current_chunk = {
+                    "step_description": step_description,
+                    "tool_responses": [response]
+                }
+
+    # Add final chunk
+    if current_chunk["tool_responses"]:
+        chunk_str = f"\n<result>{json.dumps(current_chunk)}</result>\n"
+        chunks.append(chunk_str)
+
+    # Optional: warn if any chunk is still oversized
+    for i, chunk in enumerate(chunks):
+        token_len = len(tokenizer.encode(chunk))
+        if token_len > max_tokens:
+            logger.warning(f"Chunk {i} exceeds token limit ({token_len} > {max_tokens}). Consider truncating large fields.")
+
+    return chunks
+
 class ReWooAgent:    
     def __init__(
         self,
@@ -544,6 +611,10 @@ class ReWooAgent:
         return prev_analysis_messages
 
     async def worker(self, state: PlannerState) -> WorkerState:
+        # Initialize Hugging Face GPT-2 tokenizer as an approximation
+        tokenizer: Tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        # if total tokens of a step exceeds this limit, we split the step into multiple chunks
+        MAX_TOKEN_LIMIT = 80000
 
         async def process_tool_call(tool_call: Dict) -> Dict:
             """Process a single tool call."""
@@ -620,7 +691,9 @@ class ReWooAgent:
                 error_str = f"\n<result>{json.dumps(error_result)}</result>\n"
                 final_results.append(error_str)
             else:
-                final_results.extend(f"<result>{json.dumps(result)}</result>")
+                # Split large results if necessary
+                split_results = split_large_result(result, tokenizer, MAX_TOKEN_LIMIT)
+                final_results.extend(split_results)
 
         return {
             "mcp_results": final_results,
