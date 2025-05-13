@@ -591,7 +591,7 @@ class ReWooAgent:
             return json.dumps(f"<active_whale_token_trades>{result.value.get("active_whale_token_trades", "")}</active_whale_token_trades>")
         
         
-    async def _load_previous_analysis_from_knowledge_base(self, task: str, config: RunnableConfig, store: BaseStore) -> str:
+    async def _load_previous_analysis_from_knowledge_base(self, task: str, config: RunnableConfig, store: BaseStore):
         namespace = (config["configurable"]["thread_id"], "analysis_knowledge_base")
         result = await store.asearch(namespace, query=task, limit=5)
         for res in result:
