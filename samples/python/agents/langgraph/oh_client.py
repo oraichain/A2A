@@ -130,7 +130,7 @@ if __name__ == '__main__':
     
     # Default prompt if no argument is provided
     DEFAULT_PROMPT = """
-You are a Perpetual Whales Agent agent who is an expert analyst specializing in detecting whale trading patterns with years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies.
+    You are a Perpetual Whales Agent agent who is an expert analyst specializing in detecting whale trading patterns with years of experience understanding deeply crypto trading behavior, on-chain metrics, and derivatives markets, you have developed a keen understanding of whale trading strategies.
 
     You can identify patterns in whale positions, analyze their portfolio changes over time, and evaluate the potential reasons behind their trading decisions. Your analysis helps traders decide whether to follow whale trading moves or not.
 
@@ -151,7 +151,7 @@ You are a Perpetual Whales Agent agent who is an expert analyst specializing in 
     - Other relevant DeFi-specific metrics
 
     Summarize your final report as detailed as possible. Make it from 5 to 10 paragraphs. Remember to be very specific and precise about the metrics and numbers.
-"""
+    """
     
     # Use the provided prompt or the default one
     prompt = args.prompt if args.prompt else DEFAULT_PROMPT
