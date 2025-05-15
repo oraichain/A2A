@@ -28,10 +28,12 @@ class ReWOOAgentWrapper:
     def __init__(self, sse_mcp_server_sessions: dict[str, SSEConnection]):
         self.planner_model_name = os.getenv("PLANNER_LLM_MODEL")
         self.planner_api_key = os.getenv("PLANNER_API_KEY")
-        self.planner_model = PlannerModel(model=self.planner_model_name, api_key=self.planner_api_key)
+        self.planner_base_url = os.getenv("PLANNER_BASE_URL", None)
+        self.planner_model = PlannerModel(model=self.planner_model_name, api_key=self.planner_api_key, base_url=self.planner_base_url)
         self.analysis_model_name = os.getenv("ANALYSIS_LLM_MODEL")
         self.analysis_api_key = os.getenv("ANALYSIS_API_KEY")
-        self.analysis_model = AnalysisModel(model=self.analysis_model_name, api_key=self.analysis_api_key)
+        self.analysis_base_url = os.getenv("ANALYSIS_BASE_URL", None)
+        self.analysis_model = AnalysisModel(model=self.analysis_model_name, api_key=self.analysis_api_key, base_url=self.analysis_base_url)
         self.sse_mcp_server_sessions = sse_mcp_server_sessions
         self.session_lock = asyncio.Lock()
         

@@ -90,6 +90,7 @@ class SolverState(BaseModel):
 class ReWOOModel(BaseModel):    
     model: str
     api_key: str
+    base_url: str | None = None
 
 class PlannerModel(ReWOOModel):
     type: Literal["planner"] = "planner"
@@ -726,10 +727,10 @@ class ReWooAgent:
         }
         previous_analysis_messages = await self._load_previous_analysis_from_knowledge_base(state.task, config, store)
         # NOTE: trick to save active whale token trades, so that we can use it for analysis or other tool calls
-        active_whale_token_trades = await self._presave_active_whale_token_trades(config, store)
-        logger.info(f"Active whale token trades: {active_whale_token_trades}")
-        active_whale_token_trades_message = {"role": "assistant", "content": [{"text": active_whale_token_trades, "type": "text"}]}
-        messages = [system_message, task_message, *previous_analysis_messages, active_whale_token_trades_message]
+        # active_whale_token_trades = await self._presave_active_whale_token_trades(config, store)
+        # logger.info(f"Active whale token trades: {active_whale_token_trades}")
+        # active_whale_token_trades_message = {"role": "assistant", "content": [{"text": active_whale_token_trades, "type": "text"}]}
+        messages = [system_message, task_message, *previous_analysis_messages]
     
         # Format tools for Anthropic
         formatted_tools = get_formatted_tools(self.planner_model.model, self.tools)
@@ -739,7 +740,8 @@ class ReWooAgent:
             model=self.planner_model.model,
             messages=messages,
             api_key=self.planner_model.api_key,
-            tools=formatted_tools
+            tools=formatted_tools,
+            base_url=self.planner_model.base_url
         )
         
         # Calculate cost and tokens
@@ -807,7 +809,8 @@ class ReWooAgent:
             analysis_response = await acompletion(
                 model=self.analysis_model.model,
                 messages=messages,
-                api_key=self.analysis_model.api_key
+                api_key=self.analysis_model.api_key,
+                base_url=self.analysis_model.base_url,
             )
             analysis_cost = completion_cost(analysis_response)
             analysis_token_data = analysis_response.usage if analysis_response.usage else {}
