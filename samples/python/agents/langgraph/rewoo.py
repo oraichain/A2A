@@ -183,7 +183,7 @@ async def call_tool(tool_name: str, args: Dict, sse_server_url: str) -> CallTool
     try:
         tool_result = await asyncio.wait_for(
             execute_call_tool(tool_name=tool_name, args=args, sse_server_url=sse_server_url),
-            timeout=60
+            timeout=300
         )
         return tool_result
     except Exception as e:
@@ -801,40 +801,42 @@ class ReWooAgent:
                 ]
             }
             task_message = {"role": "user", "content": [{"text": f"<task>{state.task}</task>", "type": "text"}]}
-            
             previous_analysis_messages = await self._load_previous_analysis_from_knowledge_base(state.task, config, store)
             messages = [system_message, task_message, *previous_analysis_messages]
             messages.extend([{"role": "assistant", "content": result} for result in state.mcp_results])  
             
+            logger.info(f"[Solver]Messages: {messages}")
             analysis_response = await acompletion(
                 model=self.analysis_model.model,
                 messages=messages,
                 api_key=self.analysis_model.api_key,
                 base_url=self.analysis_model.base_url,
             )
+            logger.info(f"[Solver] Analysis response: {analysis_response.choices[0].message.content}")
             analysis_cost = completion_cost(analysis_response)
             analysis_token_data = analysis_response.usage if analysis_response.usage else {}
             
             # Update metrics
-            total_cost = state.model_usage.total_cost + analysis_cost
+            model_usage = state.model_usage
+            total_cost = model_usage.total_cost + analysis_cost
             total_tokens = (
-                state.model_usage.total_tokens +
+                model_usage.total_tokens +
                 analysis_token_data.get('total_tokens', 0)
             )
             prompt_tokens = (
-                state.model_usage.prompt_tokens +
+                model_usage.prompt_tokens +
                 analysis_token_data.get('prompt_tokens', 0)
             )
             completion_tokens = (
-                state.model_usage.completion_tokens +
+                model_usage.completion_tokens +
                 analysis_token_data.get('completion_tokens', 0)
             )
             cache_read_tokens = (
-                state.model_usage.cache_read_tokens +
+                model_usage.cache_read_tokens +
                 analysis_token_data.get('cache_read_tokens', 0)
             )
             cache_write_tokens = (
-                state.model_usage.cache_write_tokens +
+                model_usage.cache_write_tokens +
                 analysis_token_data.get('cache_write_tokens', 0)
             )
             
@@ -860,10 +862,20 @@ class ReWooAgent:
         except Exception as e:
             print(f"Error in solver: {e}")
             print(traceback.format_exc())
+            model_usage = getattr(state, 'model_usage', None)
+            if model_usage is None:
+                model_usage = {
+                    "total_cost": 0,
+                    "total_tokens": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0
+                }
             return {
                 "task": state.task,
                 "analysis": "",
-                "model_usage": state.model_usage,
+                "model_usage": model_usage,
                 "type": "solver"
             }
         

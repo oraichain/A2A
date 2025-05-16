@@ -66,8 +66,8 @@ def main(host, port):
         )
         agent = ReWOOAgentWrapper(
             sse_mcp_server_sessions={
-                'hyperwhales': {
-                    'url': "http://localhost:4000/sse",
+                'hyperwhales_etl': {
+                    'url': "http://148.113.35.59:8089/sse",
                     'transport': 'sse',
                 }
             }
